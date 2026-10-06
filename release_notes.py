@@ -7,8 +7,9 @@
   set-title   只修订已有草稿的标题
   add-change  向已有草稿追加一条变更
   set-change  按展示顺序替换已有草稿的一条变更
+  export-markdown  以固定 Markdown 格式导出单个草稿到标准输出
 
-不提供版本重命名、变更删除、发布、导出或 Git 相关功能。
+不提供版本重命名、变更删除、发布或 Git 相关功能。
 """
 
 import argparse
@@ -273,6 +274,44 @@ def cmd_set_change(args):
     return 0
 
 
+def cmd_export_markdown(args):
+    # 版本名非空白；校验发生在访问数据库之前，即使数据库不存在也优先
+    # 报 Invalid draft，失败时不会新建数据库文件。
+    if is_blank(args.version):
+        return fail("Invalid draft")
+
+    # export-markdown 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        row = conn.execute(
+            "SELECT title FROM drafts WHERE version = ?", (args.version,)
+        ).fetchone()
+        if row is None:
+            return fail(f"Version not found: {args.version}")
+        title = row[0]
+
+        changes = [
+            content
+            for (content,) in conn.execute(
+                "SELECT content FROM changes WHERE version = ?"
+                " ORDER BY position",
+                (args.version,),
+            )
+        ]
+    finally:
+        conn.close()
+
+    # 固定格式：# 版本名、空行、标题、空行，随后每条变更加 "- " 前缀。
+    # 所有文本按原文输出，多行条目只在首行前加前缀，内部换行保留。
+    parts = [f"# {args.version}\n\n", f"{title}\n\n"]
+    parts.extend(f"- {content}\n" for content in changes)
+    sys.stdout.write("".join(parts))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -338,6 +377,14 @@ def build_parser():
         help="新变更文本（必填且仅允许一条），按原文原样保存",
     )
     parser_set_change.set_defaults(func=cmd_set_change)
+
+    parser_export = subparsers.add_parser(
+        "export-markdown", help="以固定 Markdown 格式导出草稿到标准输出"
+    )
+    parser_export.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_export.set_defaults(func=cmd_export_markdown)
 
     return parser
 
