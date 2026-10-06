@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持六个操作：
+支持七个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
   set-title       只修订已有草稿的标题
   add-change      向已有草稿追加一条变更
   set-change      按展示顺序替换已有草稿的一条变更
+  remove-change   按展示顺序删除已有草稿的一条变更
   export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
 
-不提供版本重命名、变更删除、发布或 Git 相关功能；Markdown 导出只写到
+不提供版本重命名、发布或 Git 相关功能；Markdown 导出只写到
 标准输出，命令本身不接收输出路径，也不创建发布说明文件。
 """
 
@@ -311,6 +312,99 @@ def cmd_set_change(args):
     return 0
 
 
+def cmd_remove_change(args):
+    # 仅允许一个 --index：未提供（None）或重复提供（多于一个）都视为无效草稿。
+    # 版本名非空白；序号只接受数字 0-9 组成且数值大于 0 的字符串，前导零
+    # 不影响定位。校验全部发生在访问数据库之前，即使版本不存在也优先报
+    # Invalid draft，失败时不会新建数据库文件。
+    indexes = args.index or []
+    if (
+        is_blank(args.version)
+        or len(indexes) != 1
+        or not re.fullmatch(r"0*[1-9][0-9]*", indexes[0])
+    ):
+        return fail("Invalid draft")
+    # 前导零不影响定位；输出序号不保留前导零。保留去零后的数字串以便
+    # 与条目总数按位数比较，避免极大序号触发整数转换或 SQLite 绑定上限。
+    index_text = indexes[0].lstrip("0")
+
+    # remove-change 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        with conn:
+            # 先确认草稿存在，再定位条目，避免改动不存在的版本。
+            exists = conn.execute(
+                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
+            ).fetchone()
+            if exists is None:
+                return fail(f"Version not found: {args.version}")
+
+            # 按展示顺序（position 升序）定位第 N 条记录，多行条目只占
+            # 一个序号。先与条目总数按十进制位数比较判定越界，无需把
+            # 大序号转换成整数。
+            count = conn.execute(
+                "SELECT COUNT(*) FROM changes WHERE version = ?",
+                (args.version,),
+            ).fetchone()[0]
+            count_text = str(count)
+            in_range = (
+                len(index_text) < len(count_text)
+                or (
+                    len(index_text) == len(count_text)
+                    and index_text <= count_text
+                )
+            )
+            if not in_range:
+                return fail(
+                    f"Change not found: {args.version} #{index_text}"
+                )
+
+            # 草稿只剩一条时不允许删除最后一条，记录原样保留。
+            if count == 1:
+                return fail(f"Cannot remove last change: {args.version}")
+
+            position = int(index_text) - 1
+            row = conn.execute(
+                "SELECT position FROM changes WHERE version = ?"
+                " ORDER BY position LIMIT 1 OFFSET ?",
+                (args.version, position),
+            ).fetchone()
+            target_position = row[0]
+            conn.execute(
+                "DELETE FROM changes WHERE version = ? AND position = ?",
+                (args.version, target_position),
+            )
+
+            # 只删除指定记录：相同文本的其他记录保留，其余条目的原文与
+            # 相对顺序不变。把剩余条目的 position 重排为连续的 0..n-1，
+            # 使后续序号仍按展示顺序从 1 开始计算。
+            remaining = [
+                pos
+                for (pos,) in conn.execute(
+                    "SELECT position FROM changes WHERE version = ?"
+                    " ORDER BY position",
+                    (args.version,),
+                )
+            ]
+            conn.executemany(
+                "UPDATE changes SET position = ?"
+                " WHERE version = ? AND position = ?",
+                [
+                    (new_position, args.version, old_position)
+                    for new_position, old_position in enumerate(remaining)
+                    if new_position != old_position
+                ],
+            )
+    finally:
+        conn.close()
+
+    print(f"Removed change: {args.version} #{index_text}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -384,6 +478,21 @@ def build_parser():
         help="新变更文本（必填且仅允许一条），按原文原样保存",
     )
     parser_set_change.set_defaults(func=cmd_set_change)
+
+    parser_remove_change = subparsers.add_parser(
+        "remove-change", help="按展示顺序删除已有草稿的一条变更"
+    )
+    parser_remove_change.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_remove_change.add_argument(
+        "--index",
+        action="append",
+        metavar="N",
+        help="变更序号（必填且仅允许一个），从 1 开始按记录计数；"
+        "只接受数字且数值大于 0，前导零不影响定位",
+    )
+    parser_remove_change.set_defaults(func=cmd_remove_change)
 
     return parser
 
