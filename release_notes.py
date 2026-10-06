@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-仅支持两个操作：
-  create  创建版本草稿（标题 + 至少一条变更）
-  show    按版本名精确查看草稿
+仅支持三个操作：
+  create    创建版本草稿（标题 + 至少一条变更）
+  set-title 修改已有草稿的标题
+  show      按版本名精确查看草稿
 
 除此之外不提供编辑、分类、发布、导出或 Git 相关功能。
 """
@@ -87,6 +88,41 @@ def cmd_create(args):
     return 0
 
 
+def cmd_set_title(args):
+    # 校验先于数据库访问：版本名或新标题为空白（含未提供）时，
+    # 即使目标版本不存在也优先报 Invalid draft，且不新建数据库文件。
+    if (
+        is_blank(args.version)
+        or args.title is None
+        or is_blank(args.title)
+    ):
+        return fail("Invalid draft")
+
+    # set-title 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        with conn:
+            exists = conn.execute(
+                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
+            ).fetchone()
+            if exists is None:
+                return fail(f"Version not found: {args.version}")
+
+            # 标题按输入原样写入；与原标题相同也视为成功，不触碰变更条目。
+            conn.execute(
+                "UPDATE drafts SET title = ? WHERE version = ?",
+                (args.title, args.version),
+            )
+    finally:
+        conn.close()
+
+    print(f"Updated title: {args.version}")
+    return 0
+
+
 def cmd_show(args):
     # show 不创建数据库：文件不存在即视为版本不存在。
     if not os.path.exists(args.db):
@@ -136,6 +172,11 @@ def build_parser():
         help="变更条目，可重复传入；按传入顺序保存",
     )
     parser_create.set_defaults(func=cmd_create)
+
+    parser_set_title = subparsers.add_parser("set-title", help="修改已有草稿的标题")
+    parser_set_title.add_argument("version", help="要修改标题的版本名")
+    parser_set_title.add_argument("--title", help="新标题（必填）")
+    parser_set_title.set_defaults(func=cmd_set_title)
 
     parser_show = subparsers.add_parser("show", help="按版本名查看草稿")
     parser_show.add_argument("version", help="要查看的版本名")
