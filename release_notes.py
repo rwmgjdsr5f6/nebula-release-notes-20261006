@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-仅支持四个操作：
-  create     创建版本草稿（标题 + 至少一条变更）
-  show       按版本名精确查看草稿
-  set-title  只修订已有草稿的标题
-  add-change 向已有草稿追加一条变更
+仅支持五个操作：
+  create      创建版本草稿（标题 + 至少一条变更）
+  show        按版本名精确查看草稿
+  set-title   只修订已有草稿的标题
+  add-change  向已有草稿追加一条变更
+  set-change  按展示顺序替换已有草稿的一条变更
 
-不提供版本重命名、变更编辑、发布、导出或 Git 相关功能。
+不提供版本重命名、变更删除、发布、导出或 Git 相关功能。
 """
 
 import argparse
 import os
+import re
 import sqlite3
 import sys
 
@@ -195,6 +197,82 @@ def cmd_add_change(args):
     return 0
 
 
+def cmd_set_change(args):
+    # 仅允许一条 --change 与一个 --index：未提供（None）或重复提供
+    # （多于一条）都视为无效草稿。版本名、新文本非空白；序号只接受数字
+    # 0-9 组成且数值大于 0 的字符串，前导零不影响定位。校验全部发生在
+    # 访问数据库之前，即使版本不存在也优先报 Invalid draft，失败时不会
+    # 新建数据库文件。
+    changes = args.change or []
+    indexes = args.index or []
+    if (
+        is_blank(args.version)
+        or len(changes) != 1
+        or is_blank(changes[0])
+        or len(indexes) != 1
+        or not re.fullmatch(r"0*[1-9][0-9]*", indexes[0])
+    ):
+        return fail("Invalid draft")
+    change = changes[0]
+    # 前导零不影响定位；输出序号不保留前导零。保留去零后的数字串以便
+    # 与条目总数按位数比较，避免极大序号触发整数转换或 SQLite 绑定上限。
+    index_text = indexes[0].lstrip("0")
+
+    # set-change 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        with conn:
+            # 先确认草稿存在，再定位条目，避免给不存在的版本补建条目。
+            exists = conn.execute(
+                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
+            ).fetchone()
+            if exists is None:
+                return fail(f"Version not found: {args.version}")
+
+            # 按展示顺序（position 升序）定位第 N 条记录，多行条目只占
+            # 一个序号。先与条目总数按十进制位数比较判定越界，无需把
+            # 大序号转换成整数。
+            count = conn.execute(
+                "SELECT COUNT(*) FROM changes WHERE version = ?",
+                (args.version,),
+            ).fetchone()[0]
+            count_text = str(count)
+            in_range = (
+                len(index_text) < len(count_text)
+                or (
+                    len(index_text) == len(count_text)
+                    and index_text <= count_text
+                )
+            )
+            if not in_range:
+                return fail(
+                    f"Change not found: {args.version} #{index_text}"
+                )
+
+            # 单条 UPDATE 天然幂等：新文本与原文相同也成功，条目的数量、
+            # 排列与其他字段均不改变。
+            position = int(index_text) - 1
+            row = conn.execute(
+                "SELECT position FROM changes WHERE version = ?"
+                " ORDER BY position LIMIT 1 OFFSET ?",
+                (args.version, position),
+            ).fetchone()
+            target_position = row[0]
+            conn.execute(
+                "UPDATE changes SET content = ?"
+                " WHERE version = ? AND position = ?",
+                (change, args.version, target_position),
+            )
+    finally:
+        conn.close()
+
+    print(f"Updated change: {args.version} #{position + 1}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -239,6 +317,27 @@ def build_parser():
         help="要追加的变更文本（必填且仅允许一条），按原文原样保存",
     )
     parser_add_change.set_defaults(func=cmd_add_change)
+
+    parser_set_change = subparsers.add_parser(
+        "set-change", help="按展示顺序替换已有草稿的一条变更"
+    )
+    parser_set_change.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_set_change.add_argument(
+        "--index",
+        action="append",
+        metavar="N",
+        help="变更序号（必填且仅允许一个），从 1 开始按记录计数；"
+        "只接受数字且数值大于 0，前导零不影响定位",
+    )
+    parser_set_change.add_argument(
+        "--change",
+        action="append",
+        metavar="TEXT",
+        help="新变更文本（必填且仅允许一条），按原文原样保存",
+    )
+    parser_set_change.set_defaults(func=cmd_set_change)
 
     return parser
 

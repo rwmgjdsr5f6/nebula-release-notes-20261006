@@ -16,6 +16,13 @@
   - add-change 无效输入（未提供 / 重复提供 --change、空白名称或文本）
     优先报 Invalid draft 且不建文件；版本不存在报 Version not found；
     失败操作不改变标题、旧条目与其他版本。
+  - set-change 成功：按展示顺序替换一条记录，多行条目只占一个序号，
+    前导零不影响定位且输出不带前导零，中文、标点、首尾空格与内部换行
+    原样保存，重复条目分别保留，同文重提幂等；
+  - set-change 无效输入（未提供 / 重复提供 --index 或 --change、空白
+    名称或文本、非正整数序号）优先报 Invalid draft 且不建文件；
+    版本 / 文件不存在报 Version not found；序号越界报 Change not found；
+    失败操作不改变标题、条目、顺序与其他版本。
 
 运行方式（项目根目录）：
     python -m unittest discover -s tests
@@ -83,6 +90,13 @@ def set_title(db_path, version, title):
 
 def add_change(db_path, version, change):
     return run_cli(db_path, "add-change", version, "--change", change)
+
+
+def set_change(db_path, version, index, change):
+    return run_cli(
+        db_path, "set-change", version, "--index", str(index),
+        "--change", change,
+    )
 
 
 class DraftFlowTestCase(unittest.TestCase):
@@ -595,6 +609,286 @@ class TestAddChange(DraftFlowTestCase):
         # 数据库文件不存在：报错且不创建文件。
         fresh_db = os.path.join(self._tmpdir.name, "fresh.sqlite")
         code, out, err = add_change(fresh_db, VERSION, "不应写入")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err, f"Version not found: {VERSION}\n")
+        self.assertFalse(os.path.exists(fresh_db), "不得在尚不存在的路径产生数据库文件")
+
+
+class TestSetChange(DraftFlowTestCase):
+    """set-change 的成功路径、序号规则与全部失败边界。"""
+
+    # 验收固定数据：标题“离线示例”，三条变更依次为两个重复条目与另一条。
+    ACCEPT_TITLE = "离线示例"
+    ACCEPT_CHANGES = ["新增预览", "新增预览", "调整提示"]
+    ACCEPT_SHOW = (
+        "Version: demo-0.1\n"
+        "Title: 离线示例\n"
+        "- 新增预览\n"
+        "- 新增预览\n"
+        "- 调整提示\n"
+    )
+
+    def create_acceptance_draft(self):
+        code, out, err = create(
+            self.db, VERSION, self.ACCEPT_TITLE, self.ACCEPT_CHANGES
+        )
+        self.assertEqual((code, out, err), (0, "Created demo-0.1\n", ""))
+
+    def test_success_output_and_only_target_entry_replaced(self):
+        self.create_acceptance_draft()
+
+        code, out, err = set_change(self.db, VERSION, 2, "修正预览说明")
+        self.assertEqual(code, 0, "set-change 退出码应为 0")
+        self.assertEqual(
+            out, "Updated change: demo-0.1 #2\n", "set-change 标准输出不符"
+        )
+        self.assertEqual(err, "", "set-change 标准错误应为空")
+
+        # 新进程查看：只有第二条被替换，其余内容、顺序与标题逐字不变。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            "Version: demo-0.1\n"
+            "Title: 离线示例\n"
+            "- 新增预览\n"
+            "- 修正预览说明\n"
+            "- 调整提示\n",
+            "应只替换指定条目，标题、其余条目与顺序保持不变",
+        )
+
+    def test_duplicate_entries_are_independently_replaceable(self):
+        self.create_acceptance_draft()
+
+        # 两条相同文本分别保留：替换其中一条不影响另一条。
+        code, out, err = set_change(self.db, VERSION, 1, "第一条改写")
+        self.assertEqual((code, out, err), (0, "Updated change: demo-0.1 #1\n", ""))
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            "Version: demo-0.1\n"
+            "Title: 离线示例\n"
+            "- 第一条改写\n"
+            "- 新增预览\n"
+            "- 调整提示\n",
+            "重复条目应分别保留，按序号只改其中一条",
+        )
+
+    def test_same_content_is_idempotent(self):
+        self.create_acceptance_draft()
+
+        code, out, err = set_change(self.db, VERSION, 2, "新增预览")
+        self.assertEqual(code, 0, "提交与原文相同的文本也应成功")
+        self.assertEqual(out, "Updated change: demo-0.1 #2\n")
+        self.assertEqual(err, "")
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.ACCEPT_SHOW, "同文重提不应改变任何内容")
+
+    def test_leading_zeros_locate_same_entry_and_output_strips_them(self):
+        self.create_acceptance_draft()
+
+        code, out, err = set_change(self.db, VERSION, "0002", "零号定位")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "Updated change: demo-0.1 #2\n", "输出序号不保留前导零")
+        self.assertEqual(err, "")
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            "Version: demo-0.1\n"
+            "Title: 离线示例\n"
+            "- 新增预览\n"
+            "- 零号定位\n"
+            "- 调整提示\n",
+        )
+
+    def test_multiline_entry_occupies_one_index_and_text_is_verbatim(self):
+        # 草稿含多行条目；序号按记录计数，多行条目只占一个序号。
+        code, out, err = create(self.db, VERSION, TITLE, CHANGES)
+        self.assertEqual(code, 0)
+
+        text = "  替换，首行：\n第二行  "
+        code, out, err = set_change(self.db, VERSION, 2, text)
+        self.assertEqual((code, out, err), (0, "Updated change: demo-0.1 #2\n", ""))
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        first_line, second_line = CHANGES[2].splitlines()
+        self.assertEqual(
+            out,
+            f"Version: {VERSION}\n"
+            f"Title: {TITLE}\n"
+            f"- {CHANGES[0]}\n"
+            f"-   替换，首行：\n"
+            f"第二行  \n"
+            f"- {first_line}\n"
+            f"{second_line}\n",
+            "序号按记录计数；新文本的首尾空格、标点与内部换行应原样保留",
+        )
+
+    def test_replace_first_and_last_entries(self):
+        self.create_acceptance_draft()
+
+        self.assertEqual(
+            set_change(self.db, VERSION, 1, "新首条"),
+            (0, "Updated change: demo-0.1 #1\n", ""),
+        )
+        self.assertEqual(
+            set_change(self.db, VERSION, 3, "新末条"),
+            (0, "Updated change: demo-0.1 #3\n", ""),
+        )
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            "Version: demo-0.1\n"
+            "Title: 离线示例\n"
+            "- 新首条\n"
+            "- 新增预览\n"
+            "- 新末条\n",
+            "条目数量与排列不变，仅首末条目文本被替换",
+        )
+
+    def test_other_versions_remain_intact(self):
+        self.create_acceptance_draft()
+        code, out, err = create(self.db, "other-2.0", "其他标题", ["其他变更"])
+        self.assertEqual(code, 0)
+
+        code, out, err = set_change(self.db, VERSION, 2, "只改 demo-0.1")
+        self.assertEqual(code, 0)
+
+        code, out, err = show(self.db, "other-2.0")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            "Version: other-2.0\nTitle: 其他标题\n- 其他变更\n",
+            "替换不得影响其他版本",
+        )
+
+    def test_index_beyond_entry_count_is_change_not_found(self):
+        self.create_acceptance_draft()
+
+        for index in (4, "04", 99999999999999999999):
+            with self.subTest(index=index):
+                code, out, err = set_change(self.db, VERSION, index, "不应写入")
+                self.assertEqual(code, 1, f"[{index}] 退出码应为 1")
+                self.assertEqual(out, "", f"[{index}] 标准输出应为空")
+                # 前导零不保留；普通数值按数值输出。
+                expected_index = int(str(index))
+                self.assertEqual(
+                    err,
+                    f"Change not found: demo-0.1 #{expected_index}\n",
+                    f"[{index}] 标准错误不符",
+                )
+
+        # 所有失败后原草稿保持不变。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.ACCEPT_SHOW)
+
+    def test_invalid_input_reports_invalid_draft_even_when_version_missing(self):
+        # 库文件尚不存在时，无效输入仍优先报 Invalid draft，且不产生文件。
+        cases = {
+            "missing_index": ["set-change", VERSION, "--change", "有效文本"],
+            "missing_change": ["set-change", VERSION, "--index", "1"],
+            "repeated_index": [
+                "set-change", VERSION, "--index", "1", "--index", "2",
+                "--change", "有效文本",
+            ],
+            "repeated_change": [
+                "set-change", VERSION, "--index", "1",
+                "--change", "a", "--change", "b",
+            ],
+            "empty_change": ["set-change", VERSION, "--index", "1", "--change", ""],
+            "whitespace_change": [
+                "set-change", VERSION, "--index", "1", "--change", "  \n\t ",
+            ],
+            "empty_version": ["set-change", "", "--index", "1", "--change", "有效文本"],
+            "whitespace_version": [
+                "set-change", "  ", "--index", "1", "--change", "有效文本",
+            ],
+            "index_zero": ["set-change", VERSION, "--index", "0", "--change", "x"],
+            "index_leading_zeros_zero": [
+                "set-change", VERSION, "--index", "000", "--change", "x",
+            ],
+            "index_negative": ["set-change", VERSION, "--index", "-1", "--change", "x"],
+            "index_decimal": ["set-change", VERSION, "--index", "1.5", "--change", "x"],
+            "index_alpha": ["set-change", VERSION, "--index", "abc", "--change", "x"],
+            "index_empty": ["set-change", VERSION, "--index", "", "--change", "x"],
+            "index_space": ["set-change", VERSION, "--index", " 1 ", "--change", "x"],
+        }
+        for label, cli_args in cases.items():
+            with self.subTest(case=label):
+                db_path = os.path.join(self._tmpdir.name, f"invalid-{label}.sqlite")
+                code, out, err = run_cli(db_path, *cli_args)
+                self.assertEqual(code, 1, f"[{label}] 退出码应为 1")
+                self.assertEqual(out, "", f"[{label}] 标准输出应为空")
+                self.assertEqual(
+                    err, "Invalid draft\n", f"[{label}] 标准错误不符"
+                )
+                self.assertFalse(
+                    os.path.exists(db_path),
+                    f"[{label}] 不得在尚不存在的路径产生数据库文件",
+                )
+
+    def test_invalid_input_does_not_modify_existing_database(self):
+        self.create_acceptance_draft()
+
+        bad_invocations = [
+            ["set-change", VERSION],
+            ["set-change", VERSION, "--index", "1"],
+            ["set-change", VERSION, "--change", "x"],
+            ["set-change", VERSION, "--index", "1", "--change", "a", "--change", "b"],
+            ["set-change", VERSION, "--index", "0", "--index", "1", "--change", "a"],
+            ["set-change", VERSION, "--index", "1", "--change", ""],
+            ["set-change", VERSION, "--index", "1", "--change", "  \n\t "],
+            ["set-change", "  ", "--index", "1", "--change", "a"],
+            ["set-change", VERSION, "--index", "0", "--change", "a"],
+            ["set-change", VERSION, "--index", "abc", "--change", "a"],
+        ]
+        for cli_args in bad_invocations:
+            with self.subTest(args=cli_args):
+                code, out, err = run_cli(self.db, *cli_args)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(err, "Invalid draft\n")
+
+        # 所有失败后原草稿（标题与条目）保持不变。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.ACCEPT_SHOW)
+
+    def test_valid_input_version_or_file_missing(self):
+        self.create_acceptance_draft()
+
+        # 库内没有对应版本：不补建草稿，原内容不变；大小写不匹配同样视为不存在。
+        for missing_version in ("demo-0.9", VERSION.upper()):
+            with self.subTest(version=missing_version):
+                code, out, err = set_change(
+                    self.db, missing_version, 1, "不应写入"
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(err, f"Version not found: {missing_version}\n")
+
+                code, out, err = show(self.db, missing_version)
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(err, f"Version not found: {missing_version}\n")
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.ACCEPT_SHOW)
+
+        # 数据库文件不存在：报错且不创建文件。
+        fresh_db = os.path.join(self._tmpdir.name, "fresh.sqlite")
+        code, out, err = set_change(fresh_db, VERSION, 1, "不应写入")
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
         self.assertEqual(err, f"Version not found: {VERSION}\n")
