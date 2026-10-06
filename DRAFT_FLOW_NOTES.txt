@@ -1,0 +1,321 @@
+================================================================================
+版本草稿创建与按版本名查看 —— 源码核对说明（纯文本，静态核对）
+================================================================================
+
+核对日期：2026-10-06
+核对目录：/mnt/c/NebulaForge/projects/forge13/solverB/task003
+核对方法：只阅读公开说明与源码，按代码路径推演结果；未执行产品代码、
+          测试或任何项目脚本。下列“预期输出/退出码”均为按源码静态推演，
+          不是运行实测。
+材料读取情况：全部可读，无“证据不可读取，无法确认”项。
+  - README.md（公开说明，106 行）
+  - release_notes.py（唯一源码，158 行）
+  - .gitignore（第 6 行 *.sqlite 等模式忽略数据库文件）
+  git 跟踪文件清单仅上述三个文本文件（git ls-files 核对）。
+
+行号引用格式：README.md:行号、release_notes.py:行号（行号对应当前版本）。
+范围限定：仅“创建草稿”和“按版本名查看草稿”，以及重复版本名、空变更
+条目两个边界；不涉及分类、发布状态、版本比较、Markdown 导出、Git 操作。
+
+
+--------------------------------------------------------------------------------
+一、从公开入口到实现的追踪
+--------------------------------------------------------------------------------
+
+1. 公开入口
+   README.md:9-13：命令行入口为 release_notes.py，两个操作都用 --db 指定
+   同一个 SQLite 数据库文件；“首次有效创建时若该文件不存在会自动建立数据库”。
+   - 创建用法：README.md:17-19
+       python release_notes.py --db notes.sqlite create <版本名> \
+         --title <标题> --change <变更> [--change <变更> ...]
+   - 查看用法：README.md:35-37
+       python release_notes.py --db notes.sqlite show <版本名>
+
+2. 程序实际入口与参数定义（源码）
+   - 进程入口：release_notes.py:156-157
+       if __name__ == "__main__": sys.exit(main())
+     main 的返回值即进程退出码（0 或 1）。
+   - --db：release_notes.py:126，required=True。
+   - 子命令：release_notes.py:127，required=True；只注册了两个：
+       create（release_notes.py:129-138）
+         version：位置参数（release_notes.py:130）
+         --title：可选项，但业务校验中按必填处理（release_notes.py:131、50-51）
+         --change：action="append"（release_notes.py:132-137），
+                   每次出现追加一个值，列表顺序等于命令行出现顺序。
+       show（release_notes.py:140-142）
+         version：位置参数（release_notes.py:141）。
+   - 分发：release_notes.py:152-153，parse_args 后调用 args.func(args)，
+     即 cmd_create（release_notes.py:42-87）或 cmd_show（release_notes.py:90-119）。
+   - 输出编码：release_notes.py:149-150，stdout/stderr 均 reconfigure 为
+     UTF-8，不依赖运行环境区域设置。
+
+3. 数据库结构（源码）
+   release_notes.py:16-28 的 SCHEMA：
+     drafts(version TEXT PRIMARY KEY, title TEXT NOT NULL)
+     changes(id INTEGER PRIMARY KEY AUTOINCREMENT,
+             version TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             content TEXT NOT NULL,
+             FOREIGN KEY(version) REFERENCES drafts(version))
+   建表时机：release_notes.py:57-59，cmd_create 在校验通过后 connect 并
+   executescript(SCHEMA)，CREATE TABLE IF NOT EXISTS，幂等。
+   cmd_show 不执行任何建表语句（release_notes.py:90-119）。
+
+
+--------------------------------------------------------------------------------
+二、示例流程：版本 0.1.0 / 标题“首次草稿” / 两条不同变更
+--------------------------------------------------------------------------------
+
+示例数据（本次核对虚构）：
+  版本名：0.1.0
+  标题：  首次草稿
+  变更1：新增草稿创建入口
+  变更2：支持按版本名查看
+
+说明：命令行中的引号由 shell 解释，程序通过 argparse 收到的是去掉外层
+引号后的字符串本身；程序内部不再做引号处理。
+
+2.1 创建（符合 README.md:17-19 的公开用法）
+
+  python release_notes.py --db notes.sqlite create 0.1.0 \
+    --title "首次草稿" \
+    --change "新增草稿创建入口" \
+    --change "支持按版本名查看"
+
+按源码逐阶段行为：
+  (1) argparse 收集：args.version="0.1.0"，args.title="首次草稿"，
+      args.change=["新增草稿创建入口", "支持按版本名查看"]
+      （append 顺序即传入顺序；release_notes.py:132-137、43）。
+  (2) 有效性校验：release_notes.py:48-55。四项条件全部不命中（版本名非空白、
+      标题非 None 且非空白、变更列表非空、逐条非空白），继续执行。
+  (3) 连接并建库建表：release_notes.py:57-59。notes.sqlite 不存在则由
+      sqlite3.connect 创建；executescript 建立 drafts、changes 两表。
+  (4) 查重：release_notes.py:62-66，SELECT 1 FROM drafts WHERE version=?，
+      参数化绑定 "0.1.0"；新库无此行，继续。
+  (5) 写入（同一事务 with conn，release_notes.py:61）：
+      - release_notes.py:68-71 插入 drafts 一行：("0.1.0", "首次草稿")。
+      - release_notes.py:72-79 executemany 插入 changes 两行，
+        position 由 enumerate(changes) 生成（release_notes.py:77），从 0 起：
+          ("0.1.0", 0, "新增草稿创建入口")
+          ("0.1.0", 1, "支持按版本名查看")
+      - 退出 with 块无异常，事务提交。
+  (6) 输出：release_notes.py:86 print(f"Created {args.version}")，
+      release_notes.py:87 return 0。
+
+  静态推演结果：退出码 0；标准输出恰好一行：
+      Created 0.1.0
+  标准错误无输出。与 README.md:26 的公开约定一致。
+
+2.2 查看（可在本进程退出后的新进程中，用同一 --db 路径执行）
+
+  python release_notes.py --db notes.sqlite show 0.1.0
+
+按源码逐阶段行为：
+  (1) release_notes.py:92-93：os.path.exists(args.db)，文件存在，继续。
+  (2) release_notes.py:97-99：SELECT title FROM drafts WHERE version=?，
+      参数 "0.1.0"，fetchone 得到 ("首次草稿",)；非 None（release_notes.py:100）。
+      标题即从 drafts.title 读回（release_notes.py:102）。
+  (3) release_notes.py:104-111：SELECT content FROM changes
+      WHERE version=? ORDER BY position，得到按 position 升序的内容序列，
+      即 ["新增草稿创建入口", "支持按版本名查看"]。条目从 changes.content
+      读回，顺序由 changes.position 决定。
+  (4) 拼装输出：release_notes.py:116-118，
+      lines = ["Version: 0.1.0", "Title: 首次草稿"]，
+      每条变更加 "- " 前缀，sys.stdout.write 以 "\n" 连接并在末尾补一个 "\n"。
+
+  静态推演结果（退出码 0，标准输出，行序如下）：
+      Version: 0.1.0
+      Title: 首次草稿
+      - 新增草稿创建入口
+      - 支持按版本名查看
+  与 README.md:39-46 的格式约定一致。
+
+2.3 版本名如何对应同一份草稿（跨命令、跨进程）
+  - 对应关系完全由“同一个 --db 文件 + 相同的版本名字符串”决定：
+    drafts.version 是 PRIMARY KEY（release_notes.py:18），同值文本唯一一行；
+    changes 行用同一版本名字符串关联（写入 release_notes.py:76，
+    查询 release_notes.py:107）。
+  - 匹配为精确匹配：create 查重 release_notes.py:63、show 查 drafts
+    release_notes.py:98、查 changes release_notes.py:107 均用 SQL "=" 且
+    未声明自定义 COLLATE，SQLite 对 TEXT 的默认比较区分大小写；
+    与 README.md:25“按原文精确匹配，区分大小写”一致。
+  - 程序本身无跨进程状态；README.md:71-75 的示例明确可在结束进程后用同一
+    数据库路径再次查看。源码每次调用都新建 sqlite3 连接
+    （release_notes.py:57、95），关闭于 release_notes.py:83-84、112-113。
+
+2.4 进程退出后保留哪些数据（持久化路径）
+  - 持久化介质：--db 指定的单个 SQLite 文件（示例中即 notes.sqlite；
+    该类文件被 .gitignore:6 的 *.sqlite 等模式忽略）。
+  - drafts 表保留：版本名、标题（release_notes.py:68-71）。
+  - changes 表保留：每条条目的内容、顺序 position（0 起），
+    以及自增 id（release_notes.py:72-79）；show 只读回 content 并按
+    position 排序，不读 id（release_notes.py:104-111）。
+  - 两条变更内容不同时各占一行；即使内容相同也分别保留——写入使用
+    executemany 且无去重逻辑（release_notes.py:72-79），与 README.md:21-22
+    “条目按传入顺序保存，重复内容分别保留”一致。
+  - 用同一 --db 路径再次 show，得到与首次完全一致、顺序不变的输出
+    （公开示例 README.md:102 的陈述，源码路径见 2.2）。
+
+2.5 用户文本在输入、存储、展示之间是否经过处理
+  - 输入：argparse 取原始字符串；cmd_create 内没有 strip、替换或转义
+    （release_notes.py:42-79 通读可证）。
+  - 存储：INSERT 全部使用 ? 参数绑定（release_notes.py:63、69-70、73-78），
+    版本名/标题/条目原文写入 SQLite（TEXT 以 UTF-8 保存）；首尾空格、
+    文本内部换行、中文、标点均不改。与 README.md:23-24 一致。
+  - 展示：不加裁剪、不做反转义；仅加固定前缀 "Version: "、"Title: "
+    （release_notes.py:116）和每条的 "- "（release_notes.py:117），
+    行间以 "\n" 连接，整体末尾一个 "\n"（release_notes.py:118）。
+    多行条目仍是一条记录，只在首行前有 "- "，内部换行原样保留
+    （release_notes.py:115 注释及 117 行实现；公开约定 README.md:48）。
+  - 输出编码：stdout/stderr 固定 UTF-8（release_notes.py:149-150）。
+
+
+--------------------------------------------------------------------------------
+三、两个边界分支
+--------------------------------------------------------------------------------
+
+3.1 重复版本名
+
+  触发条件（源码可证）：
+  - 同一 --db 数据库的 drafts 表中已存在 version 等于传入文本的行，
+    SELECT ... fetchone() 非 None（release_notes.py:62-65）。比较规则同
+    2.3（精确、区分大小写）。
+  - 兜底条件：并发进程抢先插入同主键版本时，INSERT drafts 触发
+    sqlite3.IntegrityError（PRIMARY KEY 冲突），被 release_notes.py:80-82
+    捕获（该分支为代码静态可见，并发时机未实际运行验证）。
+
+  实际结果：
+  - 返回 1（release_notes.py:66、82）；
+  - 标准错误输出（fail 定义于 release_notes.py:36-39，写 sys.stderr）：
+      Version already exists: 0.1.0
+  - 标准输出无 "Created ..."（release_notes.py:86 不会执行）。
+  - 与公开约定 README.md:30-31 一致（退出码 1、该消息、不覆盖旧标题或条目）。
+
+  失败后是否留下版本记录或条目：
+  - 不新增该版本的任何行：命中 SELECT 后在任何 INSERT 之前返回
+    （release_notes.py:65-66 先于 68-79）。
+  - 旧版本的 drafts 行与 changes 行不在本事务内修改，保持原样。
+  - IntegrityError 路径中 with conn（release_notes.py:61）回滚本事务，
+    不留部分数据（release_notes.py:80-82 注释明示）。
+  - 附注（文件层面，非版本记录层面）：数据库文件与两张表的结构创建于
+    release_notes.py:57-59，在查重之前；但“版本名已存在”这一情形本身
+    以旧版本存在为前提，即该文件和表此前已建立，本次失败不改变其内容。
+
+  用同一组示例的静态推演：
+    python release_notes.py --db notes.sqlite create 0.1.0 \
+      --title "重复版本" --change "不应写入"
+    # 退出码 1；stderr：Version already exists: 0.1.0
+  随后 show 0.1.0 的输出与 2.2 完全相同，标题仍为“首次草稿”，
+  仍为原来的两条、顺序不变（与 README.md:86-92、102 的示例一致）。
+
+3.2 空变更条目
+
+  触发条件（源码可证），空白判定函数 is_blank：text == "" 或 text.isspace()
+  （release_notes.py:31-33），即空字符串，或仅由 Python 认定的空白字符
+  （空格、制表、换行、全角空格等）组成。校验组合见 release_notes.py:48-55：
+  - 完全未提供 --change：args.change 为 None，changes 取空列表
+    （release_notes.py:43），not changes 为真（release_notes.py:52）；
+  - --change ""：空字符串，any(is_blank(...)) 命中（release_notes.py:53）；
+  - --change "   "（或纯制表/换行）：str.isspace() 为真，同样命中。
+  （同一校验分支还覆盖版本名为空/纯空白、--title 缺失即 None、
+    标题为空/纯空白：release_notes.py:49-51。这是源码现状，不另立语义。）
+
+  实际结果：
+  - 返回 1（release_notes.py:55）；
+  - 标准错误输出：Invalid draft
+  - 标准输出无 "Created ..."。
+  - 与公开约定 README.md:27-29 一致。
+
+  失败后是否留下版本记录或条目：
+  - 不留下，且通常连数据库文件都不会新建：整个校验位于
+    sqlite3.connect（release_notes.py:57）之前，注释 release_notes.py:45-47
+    明示“校验发生在连接数据库之前，失败时不会新建数据库文件”。
+    失败路径执行不到任何 SQL，无表、无 drafts 行、无 changes 行。
+  - 若 notes.sqlite 此前已存在，本进程根本不打开它，其已有内容不变。
+  - 与公开约定 README.md:27-28“不会创建文件或留下部分草稿”一致。
+
+  用同一组示例的静态推演（两种空条目形态）：
+    python release_notes.py --db notes.sqlite create 0.2.0 \
+      --title "空串条目" --change ""
+    # 退出码 1；stderr：Invalid draft；notes.sqlite 若此前不存在则不被创建
+
+    python release_notes.py --db notes.sqlite create 0.2.0 \
+      --title "空白条目" --change "   "
+    # 退出码 1；stderr：Invalid draft；同上
+  因此 2.1 创建的 0.1.0 不受任何影响，show 结果仍与 2.2 相同。
+
+  另需区分的参数缺失情形（源码可知，README 未展开）：
+  若连参数本身都缺（如不给 --db、不给版本名位置参数、不给 create/show
+  子命令），argparse 在 release_notes.py:152 解析阶段直接报错退出，
+  退出码为 argparse 标准的 2，不会进入 cmd_create/cmd_show；
+  这与“给了参数但值为空/空白”得到的退出码 1（Invalid draft）不同。
+  README 的退出码约定只描述进入业务逻辑后的 0/1 两种结果。
+
+
+--------------------------------------------------------------------------------
+四、公开约定与源码行为对照
+--------------------------------------------------------------------------------
+
+逐项核对，未发现相互矛盾之处：
+
+  公开约定（README.md）            源码实现（release_notes.py）       结论
+  -----------------------------    --------------------------------   ----
+  入口/--db 共用一库 9-13          connect(args.db) 57、95            一致
+  create 用法 17-19                parser 129-138                     一致
+  至少一条变更 21                  not changes 52                     一致
+  按传入顺序保存 21-22             enumerate 写 position 77；
+                                   ORDER BY position 读回 107-109      一致
+  重复内容分别保留 22              executemany 无去重 72-79           一致
+  原文保存，不裁剪/转义 23-24      参数绑定 69-78，全链路无 strip     一致
+  精确匹配、区分大小写 25          "=" 比较、无自定义 COLLATE 63/98   一致
+  Created <版本名>，退出 0 26      print 86，return 0 87              一致
+  Invalid draft，退出 1 27-29      fail 55，校验先于 connect 47-55    一致
+  already exists，退出 1 30-31     fail 66；IntegrityError 兜底 80-82 一致
+  不覆盖旧标题/条目 30-31          INSERT 前返回 65-66                一致
+  show 用法 35-37                  parser 140-142                     一致
+  show 输出格式 39-46              拼装 116-118                       一致
+  多行条目展示 48                  f"- {content}" 115-117             一致
+  版本/文件不存在报 not found 49-50
+                                   os.path.exists 92-93；
+                                   row is None 100-101                一致
+  首次有效创建自动建库 11-13       connect 57 + executescript 59；
+                                   无效输入在 57 之前拦截              一致（“有效”
+                                                                      二字与代码
+                                                                      相符）
+  退出后可用同路径继续读 71-75     每进程独立连接，数据在 SQLite 文件 一致
+
+README.md:6-7 声明“暂不支持编辑、分类、发布、导出或 Git 相关操作”，
+源码中 argparse 仅注册 create/show 两个子命令（release_notes.py:127-142），
+模块 docstring（release_notes.py:2-9）同样限定这两个操作，无其他命令入口。
+
+
+--------------------------------------------------------------------------------
+五、仍不能确定 / 超出本次核对范围的事项
+--------------------------------------------------------------------------------
+
+1. 本说明所有命令结果均为静态推演。按任务约定未执行 release_notes.py、
+   未运行测试或项目脚本；运行时的 Python 3 具体次版本、SQLite 版本、
+   终端显示效果不在静态核对范围内（README.md:3-4 声明依赖 Python 3
+   标准库与内置 SQLite）。
+
+2. 并发同名创建的实际时机无法静态复现；IntegrityError 回滚分支
+   （release_notes.py:80-82）代码路径存在，但其触发依赖运行时调度。
+
+3. 一处源码静态可见、但公开说明未约定且超出本次两个边界的情形：
+   cmd_show 先 os.path.exists 再 connect（release_notes.py:92-95），
+   若文件在这两步之间被外部删除，sqlite3.connect 会新建空文件，
+   随后查询因 drafts 表不存在抛出 sqlite3.OperationalError，该异常
+   未被 cmd_show 捕获。此为外部并发篡改文件的情形，README 与本次
+   核对的两个错误分支均不覆盖；此处仅记录代码现状，不指定新语义。
+
+4. 按任务要求未核对、源码/README 中也不存在入口的事项：分类、发布状态、
+   版本比较、Markdown 导出、真实 Git 操作、构建部署、外部发布。
+   对这些事项可固定表述为：当前源码未提供该行为
+   （依据：release_notes.py:127-142 仅 create/show 两个子命令）。
+
+================================================================================
+结论：README 公开的 create/show 用法在 release_notes.py 中均有对应实现，
+两份材料就正常流程、持久化、文本原样处理及两个错误分支的信息一致；
+未发现“公开约定与实现不一致”的条目。上文每个结论均附文件与行号，
+可沿 release_notes.py 与 README.md 逐条复核。
+================================================================================
