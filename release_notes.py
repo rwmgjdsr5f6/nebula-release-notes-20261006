@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-仅支持三个操作：
+仅支持四个操作：
   create     创建版本草稿（标题 + 至少一条变更）
   show       按版本名精确查看草稿
   set-title  只修订已有草稿的标题
+  add-change 向已有草稿追加一条变更
 
 不提供版本重命名、变更编辑、发布、导出或 Git 相关功能。
 """
@@ -149,6 +150,51 @@ def cmd_set_title(args):
     return 0
 
 
+def cmd_add_change(args):
+    # 仅允许一条 --change：未提供（None）或重复提供（多于一条）都视为无效草稿。
+    # 名称、追加文本非空白。校验发生在访问数据库之前，即使版本不存在也优先
+    # 报 Invalid draft，失败时不会新建数据库文件。
+    changes = args.change or []
+    if (
+        is_blank(args.version)
+        or len(changes) != 1
+        or is_blank(changes[0])
+    ):
+        return fail("Invalid draft")
+    change = changes[0]
+
+    # add-change 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        with conn:
+            # 先确认草稿存在，再计算新条目位置，避免给不存在的版本补建条目。
+            exists = conn.execute(
+                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
+            ).fetchone()
+            if exists is None:
+                return fail(f"Version not found: {args.version}")
+
+            row = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM changes"
+                " WHERE version = ?",
+                (args.version,),
+            ).fetchone()
+            next_position = row[0] + 1
+            conn.execute(
+                "INSERT INTO changes(version, position, content)"
+                " VALUES (?, ?, ?)",
+                (args.version, next_position, change),
+            )
+    finally:
+        conn.close()
+
+    print(f"Added change: {args.version}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -179,6 +225,20 @@ def build_parser():
     )
     parser_set_title.add_argument("--title", help="新标题（必填），按原文原样保存")
     parser_set_title.set_defaults(func=cmd_set_title)
+
+    parser_add_change = subparsers.add_parser(
+        "add-change", help="向已有草稿追加一条变更"
+    )
+    parser_add_change.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_add_change.add_argument(
+        "--change",
+        action="append",
+        metavar="TEXT",
+        help="要追加的变更文本（必填且仅允许一条），按原文原样保存",
+    )
+    parser_add_change.set_defaults(func=cmd_add_change)
 
     return parser
 
