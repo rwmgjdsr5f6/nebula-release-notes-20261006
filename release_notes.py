@@ -236,70 +236,98 @@ def cmd_add_change(args):
     return 0
 
 
+def parse_change_index(indexes):
+    """校验并规范化 --index 参数，供 set-change 与 remove-change 共用。
+
+    仅允许一个 --index：未提供或重复提供（多于一个）都视为无效。序号只
+    接受数字 0-9 组成且数值大于 0 的字符串，前导零不影响定位。合法时
+    返回去掉前导零的数字串（输出与错误消息中的序号同样不保留前导零）；
+    无效时返回 None。保留去零后的数字串以便与条目总数按位数比较，避免
+    极大序号触发整数转换或 SQLite 绑定上限。
+    """
+    if len(indexes) != 1 or not re.fullmatch(r"0*[1-9][0-9]*", indexes[0]):
+        return None
+    return indexes[0].lstrip("0")
+
+
+def open_existing_draft(db_path, version):
+    """不创建数据库地打开已有草稿，供 set-change 与 remove-change 共用。
+
+    数据库文件不存在或库内没有该版本（含仅大小写不同）时返回 None；
+    否则返回已打开的连接，由调用方负责关闭。
+    """
+    if not os.path.exists(db_path):
+        return None
+
+    conn = sqlite3.connect(db_path)
+    exists = conn.execute(
+        "SELECT 1 FROM drafts WHERE version = ?", (version,)
+    ).fetchone()
+    if exists is None:
+        conn.close()
+        return None
+    return conn
+
+
+def locate_change(conn, version, index_text):
+    """按展示顺序（position 升序）定位第 N 条记录，多行条目只占一个序号。
+
+    返回 (条目总数, 目标记录的 position)；序号越界时目标为 None。先与
+    条目总数按十进制位数比较判定越界，无需把大序号转换成整数。
+    """
+    count = conn.execute(
+        "SELECT COUNT(*) FROM changes WHERE version = ?",
+        (version,),
+    ).fetchone()[0]
+    count_text = str(count)
+    in_range = (
+        len(index_text) < len(count_text)
+        or (
+            len(index_text) == len(count_text)
+            and index_text <= count_text
+        )
+    )
+    if not in_range:
+        return count, None
+
+    row = conn.execute(
+        "SELECT position FROM changes WHERE version = ?"
+        " ORDER BY position LIMIT 1 OFFSET ?",
+        (version, int(index_text) - 1),
+    ).fetchone()
+    return count, row[0]
+
+
 def cmd_set_change(args):
     # 仅允许一条 --change 与一个 --index：未提供（None）或重复提供
-    # （多于一条）都视为无效草稿。版本名、新文本非空白；序号只接受数字
-    # 0-9 组成且数值大于 0 的字符串，前导零不影响定位。校验全部发生在
+    # （多于一条）都视为无效草稿。版本名、新文本非空白。校验全部发生在
     # 访问数据库之前，即使版本不存在也优先报 Invalid draft，失败时不会
     # 新建数据库文件。
     changes = args.change or []
-    indexes = args.index or []
+    index_text = parse_change_index(args.index or [])
     if (
         is_blank(args.version)
         or len(changes) != 1
         or is_blank(changes[0])
-        or len(indexes) != 1
-        or not re.fullmatch(r"0*[1-9][0-9]*", indexes[0])
+        or index_text is None
     ):
         return fail("Invalid draft")
     change = changes[0]
-    # 前导零不影响定位；输出序号不保留前导零。保留去零后的数字串以便
-    # 与条目总数按位数比较，避免极大序号触发整数转换或 SQLite 绑定上限。
-    index_text = indexes[0].lstrip("0")
 
-    # set-change 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
+    # set-change 不创建数据库：文件或版本不存在即报版本不存在。
+    conn = open_existing_draft(args.db, args.version)
+    if conn is None:
         return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
     try:
         with conn:
-            # 先确认草稿存在，再定位条目，避免给不存在的版本补建条目。
-            exists = conn.execute(
-                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
-            ).fetchone()
-            if exists is None:
-                return fail(f"Version not found: {args.version}")
-
-            # 按展示顺序（position 升序）定位第 N 条记录，多行条目只占
-            # 一个序号。先与条目总数按十进制位数比较判定越界，无需把
-            # 大序号转换成整数。
-            count = conn.execute(
-                "SELECT COUNT(*) FROM changes WHERE version = ?",
-                (args.version,),
-            ).fetchone()[0]
-            count_text = str(count)
-            in_range = (
-                len(index_text) < len(count_text)
-                or (
-                    len(index_text) == len(count_text)
-                    and index_text <= count_text
-                )
-            )
-            if not in_range:
+            count, target_position = locate_change(conn, args.version, index_text)
+            if target_position is None:
                 return fail(
                     f"Change not found: {args.version} #{index_text}"
                 )
 
             # 单条 UPDATE 天然幂等：新文本与原文相同也成功，条目的数量、
             # 排列与其他字段均不改变。
-            position = int(index_text) - 1
-            row = conn.execute(
-                "SELECT position FROM changes WHERE version = ?"
-                " ORDER BY position LIMIT 1 OFFSET ?",
-                (args.version, position),
-            ).fetchone()
-            target_position = row[0]
             conn.execute(
                 "UPDATE changes SET content = ?"
                 " WHERE version = ? AND position = ?",
@@ -308,57 +336,25 @@ def cmd_set_change(args):
     finally:
         conn.close()
 
-    print(f"Updated change: {args.version} #{position + 1}")
+    print(f"Updated change: {args.version} #{index_text}")
     return 0
 
 
 def cmd_remove_change(args):
-    # 仅允许一个 --index：未提供（None）或重复提供（多于一个）都视为无效草稿。
-    # 版本名非空白；序号只接受数字 0-9 组成且数值大于 0 的字符串，前导零
-    # 不影响定位。校验全部发生在访问数据库之前，即使版本不存在也优先报
-    # Invalid draft，失败时不会新建数据库文件。
-    indexes = args.index or []
-    if (
-        is_blank(args.version)
-        or len(indexes) != 1
-        or not re.fullmatch(r"0*[1-9][0-9]*", indexes[0])
-    ):
+    # 仅允许一个 --index。版本名非空白。校验全部发生在访问数据库之前，
+    # 即使版本不存在也优先报 Invalid draft，失败时不会新建数据库文件。
+    index_text = parse_change_index(args.index or [])
+    if is_blank(args.version) or index_text is None:
         return fail("Invalid draft")
-    # 前导零不影响定位；输出与错误消息中的序号不保留前导零。保留去零后的
-    # 数字串以便与条目总数按位数比较，避免极大序号触发整数转换或 SQLite
-    # 绑定上限。
-    index_text = indexes[0].lstrip("0")
 
-    # remove-change 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
+    # remove-change 不创建数据库：文件或版本不存在即报版本不存在。
+    conn = open_existing_draft(args.db, args.version)
+    if conn is None:
         return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
     try:
         with conn:
-            # 先确认草稿存在，再定位条目，避免误报或改动其他版本的数据。
-            exists = conn.execute(
-                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
-            ).fetchone()
-            if exists is None:
-                return fail(f"Version not found: {args.version}")
-
-            # 按展示顺序（position 升序）定位第 N 条记录，多行条目只占
-            # 一个序号。先与条目总数按十进制位数比较判定越界，无需把
-            # 大序号转换成整数。
-            count = conn.execute(
-                "SELECT COUNT(*) FROM changes WHERE version = ?",
-                (args.version,),
-            ).fetchone()[0]
-            count_text = str(count)
-            in_range = (
-                len(index_text) < len(count_text)
-                or (
-                    len(index_text) == len(count_text)
-                    and index_text <= count_text
-                )
-            )
-            if not in_range:
+            count, target_position = locate_change(conn, args.version, index_text)
+            if target_position is None:
                 return fail(
                     f"Change not found: {args.version} #{index_text}"
                 )
@@ -368,13 +364,6 @@ def cmd_remove_change(args):
             if count == 1:
                 return fail(f"Cannot remove last change: {args.version}")
 
-            position = int(index_text) - 1
-            row = conn.execute(
-                "SELECT position FROM changes WHERE version = ?"
-                " ORDER BY position LIMIT 1 OFFSET ?",
-                (args.version, position),
-            ).fetchone()
-            target_position = row[0]
             # 只删除指定的一条记录；其余条目的原文与相对顺序不变，相同
             # 文本的其他记录仍保留。剩余条目的 position 不重排：展示顺序
             # 由 ORDER BY position 决定，删除后的序号按剩余记录重新计算，
