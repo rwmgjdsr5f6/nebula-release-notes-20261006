@@ -6,8 +6,9 @@
   show       按版本名精确查看草稿
   set-title  只修订已有草稿的标题
   add-change 向已有草稿追加一条变更
+  set-change 按序号替换已有草稿的一条变更
 
-不提供版本重命名、变更编辑、发布、导出或 Git 相关功能。
+不提供版本重命名、发布、导出或 Git 相关功能。
 """
 
 import argparse
@@ -195,6 +196,64 @@ def cmd_add_change(args):
     return 0
 
 
+def cmd_set_change(args):
+    # --index、--change 各仅允许一条：未提供或重复提供都视为无效草稿。
+    # 名称、新文本非空白；序号必须是纯数字（0-9）且数值大于 0，前导零允许。
+    # 校验发生在访问数据库之前，即使版本不存在也优先报 Invalid draft，
+    # 失败时不会新建数据库文件。
+    indices = args.index or []
+    changes = args.change or []
+    if (
+        is_blank(args.version)
+        or len(indices) != 1
+        or len(changes) != 1
+        or is_blank(changes[0])
+    ):
+        return fail("Invalid draft")
+    raw_index = indices[0]
+    change = changes[0]
+    if not raw_index.isdigit() or int(raw_index) <= 0:
+        return fail("Invalid draft")
+    index = int(raw_index)
+
+    # set-change 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        with conn:
+            exists = conn.execute(
+                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
+            ).fetchone()
+            if exists is None:
+                return fail(f"Version not found: {args.version}")
+
+            # 按展示顺序（position 升序）定位第 index 条，从 1 开始计数；
+            # 多行条目仍只占一个序号。按行 id 更新，与 position 取值无关。
+            ids = [
+                row_id
+                for (row_id,) in conn.execute(
+                    "SELECT id FROM changes WHERE version = ?"
+                    " ORDER BY position",
+                    (args.version,),
+                )
+            ]
+            if index > len(ids):
+                return fail(f"Change not found: {args.version} #{index}")
+
+            # 只替换目标条目的文本：条目数量、排列、版本名、标题及其他版本不变。
+            conn.execute(
+                "UPDATE changes SET content = ? WHERE id = ?",
+                (change, ids[index - 1]),
+            )
+    finally:
+        conn.close()
+
+    print(f"Updated change: {args.version} #{index}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -239,6 +298,26 @@ def build_parser():
         help="要追加的变更文本（必填且仅允许一条），按原文原样保存",
     )
     parser_add_change.set_defaults(func=cmd_add_change)
+
+    parser_set_change = subparsers.add_parser(
+        "set-change", help="按序号替换已有草稿的一条变更"
+    )
+    parser_set_change.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_set_change.add_argument(
+        "--index",
+        action="append",
+        metavar="N",
+        help="要替换的变更序号（必填且仅允许一条），从 1 开始按展示顺序计数",
+    )
+    parser_set_change.add_argument(
+        "--change",
+        action="append",
+        metavar="TEXT",
+        help="替换后的变更文本（必填且仅允许一条），按原文原样保存",
+    )
+    parser_set_change.set_defaults(func=cmd_set_change)
 
     return parser
 
