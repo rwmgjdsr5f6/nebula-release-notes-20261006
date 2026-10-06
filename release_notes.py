@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持七个操作：
+支持八个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
+  list-drafts     列出全部草稿的版本名与标题（只读 JSON 目录）
   set-title       只修订已有草稿的标题
   add-change      向已有草稿追加一条变更
   set-change      按展示顺序替换已有草稿的一条变更
@@ -15,6 +16,7 @@
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -138,6 +140,41 @@ def cmd_show(args):
     lines = [f"Version: {args.version}", f"Title: {title}"]
     lines.extend(f"- {content}" for content in changes)
     sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_list_drafts(args):
+    """只读目录查询：输出全部草稿的版本名与标题，不含变更条目。
+
+    数据库文件不存在或库内没有草稿时输出空数组；两种情况下都不创建
+    数据库或其他文件，也不改动任何已有数据。数组按版本名原文的
+    Unicode 码点逐字符升序排列（Python 字符串默认序），前缀相同时较短
+    名称在前，不按语义版本号、创建顺序或标题排序，也不合并大小写不同
+    的名称。输出为 UTF-8 JSON 数组，ensure_ascii=False 让中文等非 ASCII
+    字符直接输出，引号、反斜杠与控制字符按 JSON 规则转义；标题与版本名
+    均按原文序列化，首尾空格与内部换行不裁剪。
+    """
+    drafts = []
+    if os.path.exists(args.db):
+        conn = sqlite3.connect(args.db)
+        try:
+            rows = conn.execute("SELECT version, title FROM drafts").fetchall()
+        except sqlite3.OperationalError:
+            # 文件虽存在但不是含 drafts 表的有效数据库时，不建表、不改文件，
+            # 按没有草稿处理，输出空数组。
+            rows = []
+        finally:
+            conn.close()
+        # 排序放在 Python 侧按版本名原文的 Unicode 码点进行，不依赖
+        # SQLite 的列排序规则。
+        rows.sort(key=lambda row: row[0])
+        drafts = [
+            {"version": version, "title": title} for version, title in rows
+        ]
+
+    sys.stdout.write(
+        json.dumps(drafts, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
     return 0
 
 
@@ -406,6 +443,11 @@ def build_parser():
     parser_show = subparsers.add_parser("show", help="按版本名查看草稿")
     parser_show.add_argument("version", help="要查看的版本名")
     parser_show.set_defaults(func=cmd_show)
+
+    parser_list_drafts = subparsers.add_parser(
+        "list-drafts", help="列出全部草稿的版本名与标题（只读）"
+    )
+    parser_list_drafts.set_defaults(func=cmd_list_drafts)
 
     parser_export_markdown = subparsers.add_parser(
         "export-markdown", help="按固定 Markdown 格式导出单个草稿到标准输出"
