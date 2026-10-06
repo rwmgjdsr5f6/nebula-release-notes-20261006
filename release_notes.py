@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-仅支持两个操作：
-  create  创建版本草稿（标题 + 至少一条变更）
-  show    按版本名精确查看草稿
+仅支持三个操作：
+  create     创建版本草稿（标题 + 至少一条变更）
+  show       按版本名精确查看草稿
+  set-title  只修订已有草稿的标题
 
-除此之外不提供编辑、分类、发布、导出或 Git 相关功能。
+不提供版本重命名、变更编辑、发布、导出或 Git 相关功能。
 """
 
 import argparse
@@ -119,6 +120,35 @@ def cmd_show(args):
     return 0
 
 
+def cmd_set_title(args):
+    # 名称、标题非空白；标题未提供（None）同样视为无效草稿。
+    # 校验发生在访问数据库之前，即使版本不存在也优先报 Invalid draft，
+    # 失败时不会新建数据库文件。
+    if is_blank(args.version) or args.title is None or is_blank(args.title):
+        return fail("Invalid draft")
+
+    # set-title 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        # 单条 UPDATE 天然幂等：标题相同则匹配但不改变任何内容，
+        # 不会新增草稿或变更条目；版本不存在时 rowcount 为 0。
+        with conn:
+            cursor = conn.execute(
+                "UPDATE drafts SET title = ? WHERE version = ?",
+                (args.title, args.version),
+            )
+            if cursor.rowcount == 0:
+                return fail(f"Version not found: {args.version}")
+    finally:
+        conn.close()
+
+    print(f"Updated title: {args.version}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -140,6 +170,15 @@ def build_parser():
     parser_show = subparsers.add_parser("show", help="按版本名查看草稿")
     parser_show.add_argument("version", help="要查看的版本名")
     parser_show.set_defaults(func=cmd_show)
+
+    parser_set_title = subparsers.add_parser(
+        "set-title", help="只修订已有草稿的标题"
+    )
+    parser_set_title.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_set_title.add_argument("--title", help="新标题（必填），按原文原样保存")
+    parser_set_title.set_defaults(func=cmd_set_title)
 
     return parser
 

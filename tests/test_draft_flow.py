@@ -6,6 +6,9 @@
   - 重复版本创建失败且不破坏已有内容；
   - 空白变更创建失败：已有数据库不被修改、不存在的路径不产生文件；
   - 查看不存在的版本：退出码与标准错误。
+  - set-title 成功：标题原样更新且幂等，版本名与变更的原文、数量、顺序不变；
+  - set-title 无效输入优先报 Invalid draft 且不建文件；版本不存在报
+    Version not found；其他版本与已有条目不被失败操作改变。
 
 运行方式（项目根目录）：
     python -m unittest discover -s tests
@@ -65,6 +68,10 @@ def create(db_path, version, title, changes):
 
 def show(db_path, version):
     return run_cli(db_path, "show", version)
+
+
+def set_title(db_path, version, title):
+    return run_cli(db_path, "set-title", version, "--title", title)
 
 
 class DraftFlowTestCase(unittest.TestCase):
@@ -186,6 +193,122 @@ class TestInvalidCreate(DraftFlowTestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(out, "")
                 self.assertEqual(err, "Version not found: demo-0.2\n")
+
+
+class TestSetTitle(DraftFlowTestCase):
+    NEW_TITLE = " 修订，标题：\n第二行 "
+
+    def expected_show_with(self, title):
+        """与 EXPECTED_SHOW 同构，仅替换标题行。"""
+        first_line, second_line = CHANGES[2].splitlines()
+        return (
+            f"Version: {VERSION}\n"
+            f"Title: {title}\n"
+            f"- {CHANGES[0]}\n"
+            f"- {CHANGES[1]}\n"
+            f"- {first_line}\n"
+            f"{second_line}\n"
+        )
+
+    def test_set_title_success_output_and_persisted_content(self):
+        self.create_demo_01()
+
+        code, out, err = set_title(self.db, VERSION, self.NEW_TITLE)
+        self.assertEqual(code, 0, "set-title 退出码应为 0")
+        self.assertEqual(out, "Updated title: demo-0.1\n", "set-title 标准输出不符")
+        self.assertEqual(err, "", "set-title 标准错误应为空")
+
+        # 新进程查看：只有标题改变，版本名与两条变更原文、数量、顺序不变。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            out,
+            self.expected_show_with(self.NEW_TITLE),
+            "show 应精确保留新标题的首尾空格、标点与内部换行，变更保持原样",
+        )
+
+    def test_same_title_is_idempotent(self):
+        self.create_demo_01()
+
+        first = set_title(self.db, VERSION, self.NEW_TITLE)
+        second = set_title(self.db, VERSION, self.NEW_TITLE)
+        self.assertEqual(first, (0, "Updated title: demo-0.1\n", ""))
+        self.assertEqual(second, (0, "Updated title: demo-0.1\n", ""))
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.expected_show_with(self.NEW_TITLE))
+
+    def test_set_title_is_case_sensitive_and_leaves_other_versions_intact(self):
+        self.create_demo_01()
+
+        # 大小写不同的版本名视为不存在，且不得改动原草稿。
+        code, out, err = set_title(self.db, VERSION.upper(), "不应写入")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(err, f"Version not found: {VERSION.upper()}\n")
+
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, EXPECTED_SHOW, "大小写不匹配的修订不应改变原草稿")
+
+    def test_invalid_input_reports_invalid_draft_even_when_version_missing(self):
+        # 库文件尚不存在时，无效输入仍优先报 Invalid draft，且不产生文件。
+        cases = {
+            "missing_title": ["set-title", "missing-1"],
+            "empty_title": ["set-title", VERSION, "--title", ""],
+            "whitespace_title": ["set-title", VERSION, "--title", "  \n\t "],
+            "empty_version": ["set-title", "", "--title", "有效标题"],
+            "whitespace_version": ["set-title", "   ", "--title", "有效标题"],
+        }
+        for label, cli_args in cases.items():
+            with self.subTest(case=label):
+                db_path = os.path.join(self._tmpdir.name, f"invalid-{label}.sqlite")
+                code, out, err = run_cli(db_path, *cli_args)
+                self.assertEqual(code, 1, f"[{label}] 退出码应为 1")
+                self.assertEqual(out, "", f"[{label}] 标准输出应为空")
+                self.assertEqual(
+                    err, "Invalid draft\n", f"[{label}] 标准错误不符"
+                )
+                self.assertFalse(
+                    os.path.exists(db_path),
+                    f"[{label}] 不得在尚不存在的路径产生数据库文件",
+                )
+
+    def test_invalid_input_does_not_modify_existing_database(self):
+        self.create_demo_01()
+
+        for title in (None, "", "  \n\t "):
+            with self.subTest(title=title):
+                if title is None:
+                    code, out, err = run_cli(self.db, "set-title", VERSION)
+                else:
+                    code, out, err = set_title(self.db, VERSION, title)
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertEqual(err, "Invalid draft\n")
+
+        # 所有失败后原草稿（含原标题）保持不变。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, EXPECTED_SHOW)
+
+    def test_valid_input_version_missing_on_existing_database(self):
+        self.create_demo_01()
+
+        code, out, err = set_title(self.db, "demo-0.9", "新标题")
+        self.assertEqual(code, 1, "版本不存在退出码应为 1")
+        self.assertEqual(out, "")
+        self.assertEqual(err, "Version not found: demo-0.9\n")
+
+        # 原草稿不变，且不补建缺失版本。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, EXPECTED_SHOW)
+        code, out, err = show(self.db, "demo-0.9")
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err, "Version not found: demo-0.9\n")
 
 
 if __name__ == "__main__":
