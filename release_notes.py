@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持七个操作：
+支持八个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
+  list-drafts     列出全部已保存草稿的版本名与标题
   set-title       只修订已有草稿的标题
   add-change      向已有草稿追加一条变更
   set-change      按展示顺序替换已有草稿的一条变更
@@ -15,6 +16,7 @@
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -138,6 +140,39 @@ def cmd_show(args):
     lines = [f"Version: {args.version}", f"Title: {title}"]
     lines.extend(f"- {content}" for content in changes)
     sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_list_drafts(args):
+    # 只读目录查询：数据库文件不存在时直接输出空数组，不连接、不建库。
+    items = []
+    if os.path.exists(args.db):
+        conn = sqlite3.connect(args.db)
+        try:
+            # 不执行任何建表语句：文件存在但没有 drafts 表时与空库等价，
+            # 仍然输出 []，不补建表结构。
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master"
+                " WHERE type = 'table' AND name = 'drafts'"
+            ).fetchone()
+            if has_table is not None:
+                rows = conn.execute(
+                    "SELECT version, title FROM drafts"
+                ).fetchall()
+                # 排序在 Python 侧按版本名原文逐字符比较：即 Unicode
+                # 码点升序，前缀相同时较短名称在前，不做语义版本解析，
+                # 也不合并大小写不同的名称。
+                rows.sort(key=lambda row: row[0])
+                items = [
+                    {"version": version, "title": title}
+                    for version, title in rows
+                ]
+        finally:
+            conn.close()
+
+    # ensure_ascii=False：中文等非 ASCII 字符直接输出；引号、反斜杠与
+    # 控制字符仍由 json 按规则转义。末尾恰有一个换行，无其他提示语。
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
     return 0
 
 
@@ -406,6 +441,11 @@ def build_parser():
     parser_show = subparsers.add_parser("show", help="按版本名查看草稿")
     parser_show.add_argument("version", help="要查看的版本名")
     parser_show.set_defaults(func=cmd_show)
+
+    parser_list_drafts = subparsers.add_parser(
+        "list-drafts", help="列出全部已保存草稿的版本名与标题"
+    )
+    parser_list_drafts.set_defaults(func=cmd_list_drafts)
 
     parser_export_markdown = subparsers.add_parser(
         "export-markdown", help="按固定 Markdown 格式导出单个草稿到标准输出"
