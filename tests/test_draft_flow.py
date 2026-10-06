@@ -5,6 +5,8 @@
   - show 跨进程重复查看结果一致，输出与 README 格式精确匹配；
   - 重复版本创建失败且不破坏已有内容；
   - 空白变更创建失败：已有数据库不被修改、不存在的路径不产生文件；
+  - create 输入校验：空白版本名、缺失/空白标题、完全未提供 --change
+    均报 Invalid draft，不存在的路径不产生文件，已有草稿逐字不变；
   - 查看不存在的版本：退出码与标准错误。
   - set-title 成功：标题原样更新且幂等，版本名与变更的原文、数量、顺序不变；
   - set-title 无效输入优先报 Invalid draft 且不建文件；版本不存在报
@@ -202,6 +204,128 @@ class TestInvalidCreate(DraftFlowTestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(out, "")
                 self.assertEqual(err, "Version not found: demo-0.2\n")
+
+
+class TestCreateInputValidation(DraftFlowTestCase):
+    """create 输入校验回归：每次只改变一个待验证条件。
+
+    有效基准输入：版本 demo-0.2、标题“有效标题”、变更“新增预览”。
+    所有无效调用统一返回退出码 1、空标准输出、标准错误恰为
+    "Invalid draft" 加一个末尾换行。
+    """
+
+    VALID_VERSION = "demo-0.2"
+    VALID_TITLE = "有效标题"
+    VALID_CHANGE = "新增预览"
+
+    # 每个用例相对有效基准只改变一个条件；空白样例由空格、制表符与换行组成。
+    INVALID_CASES = {
+        "empty_version": ["create", "", "--title", VALID_TITLE, "--change", VALID_CHANGE],
+        "whitespace_version": [
+            "create", "  \n\t ", "--title", VALID_TITLE, "--change", VALID_CHANGE,
+        ],
+        "missing_title": ["create", VALID_VERSION, "--change", VALID_CHANGE],
+        "empty_title": ["create", VALID_VERSION, "--title", "", "--change", VALID_CHANGE],
+        "whitespace_title": [
+            "create", VALID_VERSION, "--title", "  \n\t ", "--change", VALID_CHANGE,
+        ],
+        # 即 python release_notes.py --db notes.sqlite create demo-0.2 --title "有效标题"
+        "missing_change": ["create", VALID_VERSION, "--title", VALID_TITLE],
+    }
+
+    DEMO_01_TITLE = " 离线示例 "
+    DEMO_01_CHANGES = ["新增预览", "调整提示"]
+    DEMO_01_SHOW = (
+        "Version: demo-0.1\n"
+        "Title:  离线示例 \n"
+        "- 新增预览\n"
+        "- 调整提示\n"
+    )
+
+    def assert_invalid_draft(self, db_path, cli_args, case_label):
+        code, out, err = run_cli(db_path, *cli_args)
+        self.assertEqual(code, 1, f"[{case_label}] 无效创建退出码应为 1")
+        self.assertEqual(out, "", f"[{case_label}] 无效创建标准输出应为空")
+        self.assertEqual(
+            err, "Invalid draft\n", f"[{case_label}] 无效创建标准错误不符"
+        )
+
+    def assert_demo_02_missing(self, db_path, case_label):
+        code, out, err = show(db_path, self.VALID_VERSION)
+        self.assertEqual(code, 1, f"[{case_label}] 查看 demo-0.2 退出码应为 1")
+        self.assertEqual(out, "", f"[{case_label}] 查看 demo-0.2 标准输出应为空")
+        self.assertEqual(
+            err,
+            "Version not found: demo-0.2\n",
+            f"[{case_label}] 查看 demo-0.2 标准错误不符",
+        )
+
+    def assert_demo_01_unchanged(self, case_label):
+        """新进程查看 demo-0.1，输出应与失败前逐字一致。"""
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual(code, 0, f"[{case_label}] 查看 demo-0.1 退出码应为 0")
+        self.assertEqual(err, "", f"[{case_label}] 查看 demo-0.1 标准错误应为空")
+        self.assertEqual(
+            out,
+            self.DEMO_01_SHOW,
+            f"[{case_label}] 失败后 demo-0.1 的标题首尾空格、条目文本和顺序不应改变",
+        )
+
+    def test_invalid_input_on_fresh_path_creates_no_file(self):
+        for label, cli_args in self.INVALID_CASES.items():
+            with self.subTest(case=label):
+                db_path = os.path.join(
+                    self._tmpdir.name, f"create-invalid-{label}.sqlite"
+                )
+                self.assert_invalid_draft(db_path, cli_args, label)
+                self.assertFalse(
+                    os.path.exists(db_path),
+                    f"[{label}] 无效创建不得在尚不存在的路径产生数据库文件",
+                )
+
+                # 该路径上查看 demo-0.2 应为版本不存在，且仍不产生文件。
+                self.assert_demo_02_missing(db_path, label)
+                self.assertFalse(
+                    os.path.exists(db_path),
+                    f"[{label}] show 也不应在该路径产生数据库文件",
+                )
+
+    def test_invalid_input_on_existing_database_preserves_draft(self):
+        # 先创建 demo-0.1：标题“ 离线示例 ”，依次保存“新增预览”和“调整提示”。
+        code, out, err = create(
+            self.db, VERSION, self.DEMO_01_TITLE, self.DEMO_01_CHANGES
+        )
+        self.assertEqual((code, out, err), (0, "Created demo-0.1\n", ""))
+
+        # 失败前的基准输出。
+        code, out, err = show(self.db, VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, self.DEMO_01_SHOW)
+
+        # 为 demo-0.2 创建缺少变更的草稿：报 Invalid draft，不留任何内容。
+        self.assert_invalid_draft(
+            self.db,
+            ["create", self.VALID_VERSION, "--title", self.VALID_TITLE],
+            "missing_change",
+        )
+        self.assert_demo_02_missing(self.db, "missing_change")
+        self.assert_demo_01_unchanged("missing_change")
+
+        # 用已存在的 demo-0.1 提交缺少标题或空白标题的创建请求：
+        # 优先报 Invalid draft，不得改报 Version already exists。
+        existing_version_cases = {
+            "missing_title": ["create", VERSION, "--change", self.VALID_CHANGE],
+            "empty_title": [
+                "create", VERSION, "--title", "", "--change", self.VALID_CHANGE,
+            ],
+            "whitespace_title": [
+                "create", VERSION, "--title", "  \n\t ", "--change", self.VALID_CHANGE,
+            ],
+        }
+        for label, cli_args in existing_version_cases.items():
+            with self.subTest(case=label, version=VERSION):
+                self.assert_invalid_draft(self.db, cli_args, label)
+                self.assert_demo_01_unchanged(label)
 
 
 class TestSetTitle(DraftFlowTestCase):
