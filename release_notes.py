@@ -93,18 +93,26 @@ def cmd_create(args):
     return 0
 
 
-def cmd_show(args):
-    # show 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
-        return fail(f"Version not found: {args.version}")
+def load_draft(db_path, version):
+    """按版本名原文精确匹配读取草稿，供 show 与 export-markdown 共用。
 
-    conn = sqlite3.connect(args.db)
+    数据库文件不存在或版本不存在时返回 None；连接以只读方式使用，
+    不会新建数据库。命中时返回 (标题, 变更列表)：版本名区分大小写
+    精确匹配，变更按展示顺序（position 升序）读取全部记录，不去重、
+    不裁剪、不转义，多行变更仍只是一条记录。
+    """
+    # show 与 export-markdown 均为只读入口，不创建数据库：文件不存在
+    # 即视为版本不存在。
+    if not os.path.exists(db_path):
+        return None
+
+    conn = sqlite3.connect(db_path)
     try:
         row = conn.execute(
-            "SELECT title FROM drafts WHERE version = ?", (args.version,)
+            "SELECT title FROM drafts WHERE version = ?", (version,)
         ).fetchone()
         if row is None:
-            return fail(f"Version not found: {args.version}")
+            return None
         title = row[0]
 
         changes = [
@@ -112,11 +120,20 @@ def cmd_show(args):
             for (content,) in conn.execute(
                 "SELECT content FROM changes WHERE version = ?"
                 " ORDER BY position",
-                (args.version,),
+                (version,),
             )
         ]
     finally:
         conn.close()
+
+    return title, changes
+
+
+def cmd_show(args):
+    draft = load_draft(args.db, args.version)
+    if draft is None:
+        return fail(f"Version not found: {args.version}")
+    title, changes = draft
 
     # 原样输出；多行变更只在首行前加 "- "，内部换行保留。
     lines = [f"Version: {args.version}", f"Title: {title}"]
@@ -131,30 +148,10 @@ def cmd_export_markdown(args):
     if is_blank(args.version):
         return fail("Invalid draft")
 
-    # export-markdown 为只读导出，不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
+    draft = load_draft(args.db, args.version)
+    if draft is None:
         return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
-    try:
-        row = conn.execute(
-            "SELECT title FROM drafts WHERE version = ?", (args.version,)
-        ).fetchone()
-        if row is None:
-            return fail(f"Version not found: {args.version}")
-        title = row[0]
-
-        changes = [
-            content
-            for (content,) in conn.execute(
-                "SELECT content FROM changes WHERE version = ?"
-                " ORDER BY position",
-                (args.version,),
-            )
-        ]
-    finally:
-        conn.close()
-
+    title, changes = draft
     # 固定格式逐字拼接，全程不转义、不整理空白：
     # "# " + 版本名原文 + 两个换行；标题原文 + 两个换行；
     # 每条变更按 show 的展示顺序加 "- " 前缀和一个换行，多行条目只在
