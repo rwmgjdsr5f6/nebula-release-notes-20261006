@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-仅支持五个操作：
-  create      创建版本草稿（标题 + 至少一条变更）
-  show        按版本名精确查看草稿
-  set-title   只修订已有草稿的标题
-  add-change  向已有草稿追加一条变更
-  set-change  按展示顺序替换已有草稿的一条变更
+支持六个操作：
+  create          创建版本草稿（标题 + 至少一条变更）
+  show            按版本名精确查看草稿
+  set-title       只修订已有草稿的标题
+  add-change      向已有草稿追加一条变更
+  set-change      按展示顺序替换已有草稿的一条变更
+  export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
 
-不提供版本重命名、变更删除、发布、导出或 Git 相关功能。
+不提供版本重命名、变更删除、发布或 Git 相关功能；Markdown 导出只写到
+标准输出，命令本身不接收输出路径，也不创建发布说明文件。
 """
 
 import argparse
@@ -120,6 +122,46 @@ def cmd_show(args):
     lines = [f"Version: {args.version}", f"Title: {title}"]
     lines.extend(f"- {content}" for content in changes)
     sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+def cmd_export_markdown(args):
+    # 版本名为空或仅由空白时优先报 Invalid draft，即使数据库文件不存在
+    # 也是如此。校验发生在访问数据库之前，失败时不会新建数据库文件。
+    if is_blank(args.version):
+        return fail("Invalid draft")
+
+    # export-markdown 为只读导出，不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        row = conn.execute(
+            "SELECT title FROM drafts WHERE version = ?", (args.version,)
+        ).fetchone()
+        if row is None:
+            return fail(f"Version not found: {args.version}")
+        title = row[0]
+
+        changes = [
+            content
+            for (content,) in conn.execute(
+                "SELECT content FROM changes WHERE version = ?"
+                " ORDER BY position",
+                (args.version,),
+            )
+        ]
+    finally:
+        conn.close()
+
+    # 固定格式逐字拼接，全程不转义、不整理空白：
+    # "# " + 版本名原文 + 两个换行；标题原文 + 两个换行；
+    # 每条变更按 show 的展示顺序加 "- " 前缀和一个换行，多行条目只在
+    # 首行前加前缀，内部换行与首尾空格原样保留。
+    parts = [f"# {args.version}\n\n", f"{title}\n\n"]
+    parts.extend(f"- {content}\n" for content in changes)
+    sys.stdout.write("".join(parts))
     return 0
 
 
@@ -294,6 +336,14 @@ def build_parser():
     parser_show = subparsers.add_parser("show", help="按版本名查看草稿")
     parser_show.add_argument("version", help="要查看的版本名")
     parser_show.set_defaults(func=cmd_show)
+
+    parser_export_markdown = subparsers.add_parser(
+        "export-markdown", help="按固定 Markdown 格式导出单个草稿到标准输出"
+    )
+    parser_export_markdown.add_argument(
+        "version", help="要导出的版本名，按原文精确匹配，区分大小写"
+    )
+    parser_export_markdown.set_defaults(func=cmd_export_markdown)
 
     parser_set_title = subparsers.add_parser(
         "set-title", help="只修订已有草稿的标题"
