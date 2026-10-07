@@ -287,6 +287,17 @@ def cmd_add_change(args):
 
     conn = sqlite3.connect(args.db)
     try:
+        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
+        # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
+        # drafts/changes、不插入变更，也不改动原有表结构与数据。此查询只
+        # 读 sqlite_master，不会开启写事务或产生 journal。
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'drafts'"
+        ).fetchone()
+        if has_table is None:
+            return fail(f"Version not found: {args.version}")
+
         with conn:
             # 先确认草稿存在，再计算新条目位置，避免给不存在的版本补建条目。
             exists = conn.execute(
