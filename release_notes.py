@@ -4,7 +4,7 @@
 支持九个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
-  list-drafts     列出全部已保存草稿的版本名与标题
+  list-drafts     列出全部已保存草稿的版本名与标题，可用 --prefix 按版本名前缀筛选
   set-title       只修订已有草稿的标题
   add-change      向已有草稿追加一条变更
   set-change      按展示顺序替换已有草稿的一条变更
@@ -145,6 +145,17 @@ def cmd_show(args):
 
 
 def cmd_list_drafts(args):
+    # --prefix 校验优先于一切数据库访问：显式提供却没有值（argparse 给
+    # 空串）、值为空或仅含空白、重复提供，都报 Invalid draft，即使数据库
+    # 文件不存在也先返回此错误，且不会新建数据库文件。
+    prefixes = args.prefix
+    if prefixes is not None:
+        if len(prefixes) != 1 or is_blank(prefixes[0]):
+            return fail("Invalid draft")
+        prefix = prefixes[0]
+    else:
+        prefix = None
+
     # 只读目录查询：数据库文件不存在时直接输出空数组，不连接、不建库。
     items = []
     if os.path.exists(args.db):
@@ -160,6 +171,12 @@ def cmd_list_drafts(args):
                 rows = conn.execute(
                     "SELECT version, title FROM drafts"
                 ).fetchall()
+                # 前缀筛选在 Python 侧按版本名原文逐字符比较：区分大小写，
+                # 不解析语义版本，前缀不裁剪，中文、首尾空格与内部换行按
+                # 原文比较；% 和 _ 只是普通字符，不参与通配。标题与变更
+                # 不参与匹配。
+                if prefix is not None:
+                    rows = [row for row in rows if row[0].startswith(prefix)]
                 # 排序在 Python 侧按版本名原文逐字符比较：即 Unicode
                 # 码点升序，前缀相同时较短名称在前，不做语义版本解析，
                 # 也不合并大小写不同的名称。
@@ -497,6 +514,15 @@ def build_parser():
 
     parser_list_drafts = subparsers.add_parser(
         "list-drafts", help="列出全部已保存草稿的版本名与标题"
+    )
+    parser_list_drafts.add_argument(
+        "--prefix",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="TEXT",
+        help="可选的版本名前缀（仅允许一个且非空白）：只列出版本名原文"
+        "以它开头的草稿，区分大小写，%% 和 _ 按普通字符处理",
     )
     parser_list_drafts.set_defaults(func=cmd_list_drafts)
 
