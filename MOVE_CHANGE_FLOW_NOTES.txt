@@ -1,0 +1,314 @@
+MOVE_CHANGE_FLOW_NOTES.txt
+删除条目后按当前展示序号移动变更 —— 流程说明与源码对照
+
+====================================================================
+0. 范围、依据与阅读约定
+====================================================================
+
+本说明只覆盖一条流程：先用 remove-change 删除一条变更，再用
+move-change 按删除后的当前展示序号移动一条变更，最后用 show 与
+export-markdown 查看结果。全部结论对应唯一源码文件
+release_notes.py（当前工作目录），行号引用该文件当前内容。
+不新增任何产品功能，不改变任何命令行为与 SQLite 数据兼容性。
+
+两类陈述在文中明确区分：
+
+  [公开约定]  指源码中面向使用者的稳定承诺：模块文档字符串
+              （release_notes.py:1-18）、各子命令的 help 文本与参数
+              说明（build_parser，release_notes.py:585-736）、函数
+              文档字符串。这些是命令公开用法的一部分。
+  [静态推演]  指仅通过阅读源码控制流与字符串拼接规则推导出的
+              结果（退出码、输出字节、数据库状态）。本说明不执行
+              任何产品命令，所有"预期"字样均为静态推演。
+
+未约定情形不外推：凡源码未定义的行为（例如数据库文件损坏、
+磁盘只读、并发写入冲突的最终表现），本说明不将其推断为任何
+业务错误（Invalid draft / Version not found / Change not found），
+也不给出其输出或退出码。
+
+====================================================================
+1. 固定样例与草稿准备（公开用法）
+====================================================================
+
+固定样例（本说明全程使用）：
+  版本名：demo-0.2
+  标题：  预览版
+  四条变更，按传入顺序依次为：
+    第 1 条：新增预览
+    第 2 条：临时记录
+    第 3 条：两行文本，第一行是"改善提示"，第二行是"保留换行"
+             （一条记录，内容内部含一个换行）
+    第 4 条：新增预览        （与第 1 条文本相同的重复记录）
+
+准备草稿的公开用法（[公开约定]：create 子命令与 --change 可重复
+传入、按传入顺序保存，见 release_notes.py:592-601 的参数定义与
+help；同一数据库路径由 --db 指定，release_notes.py:589）：
+
+  python release_notes.py --db drafts.db create demo-0.2 \
+      --title 预览版 \
+      --change 新增预览 \
+      --change 临时记录 \
+      --change "改善提示
+保留换行" \
+      --change 新增预览
+
+说明：第三条 --change 的值是一个内含换行的单一参数（shell 中
+用引号包住换行），因此它是一条记录而非两条。[静态推演]
+cmd_create（release_notes.py:53-98）用 enumerate 把四条变更按
+传入顺序写入 changes 表，position 依次为 0、1、2、3
+（release_notes.py:83-90）；标题写入 drafts 表
+（release_notes.py:79-82）。重复文本"新增预览"产生两条互相
+独立的记录，不去重（add-change 注释同样确认不去重，
+release_notes.py:350-352）。
+
+后续所有命令使用同一数据库路径 drafts.db。show 的公开用法：
+python release_notes.py --db drafts.db show demo-0.2
+（release_notes.py:603-605）；export-markdown 的公开用法：
+python release_notes.py --db drafts.db export-markdown demo-0.2
+（release_notes.py:625-631）。
+
+====================================================================
+2. 第一步：remove-change demo-0.2 --index 2
+====================================================================
+
+命令（[公开约定]：remove-change 按展示顺序删除一条变更，
+--index 必填且仅允许一个，从 1 开始按记录计数，只接受数字且
+数值大于 0，前导零不影响定位，release_notes.py:677-690）：
+
+  python release_notes.py --db drafts.db remove-change demo-0.2 --index 2
+
+[静态推演] 源码路径逐步对应：
+
+  a) 输入校验（cmd_remove_change，release_notes.py:436-442）：
+     --index 恰好一个且为 "2"，经 validate_change_index
+     （release_notes.py:265-279）匹配正则 0*[1-9][0-9]*
+     （release_notes.py:277）通过，去前导零后 index_text 为 "2"
+     （release_notes.py:279）；版本名 "demo-0.2" 非空白
+     （is_blank，release_notes.py:42-44）。校验全部发生在连接
+     数据库之前（release_notes.py:437-439 注释）。
+
+  b) 草稿查找（open_draft_for_update，release_notes.py:282-315）：
+     drafts.db 存在、含 drafts 表、含版本 demo-0.2，返回连接。
+
+  c) 序号判断（locate_change，release_notes.py:365-392）：
+     条目总数 count = 4；序号 "2" 与总数文本 "4" 按位数与字典序
+     比较判定在界内（release_notes.py:376-385）；按
+     ORDER BY position LIMIT 1 OFFSET 1
+     （release_notes.py:387-391）定位到 position = 1 的记录，
+     即"临时记录"。多行条目只占一个序号（release_notes.py:365
+     文档字符串），所以第 3 条两行文本此时仍是一个序号。
+
+  d) 删除写入（release_notes.py:455-467）：count 为 4 而非 1，
+     不触发"至少保留一条变更"的拒绝分支（release_notes.py:457-458）；
+     执行 DELETE ... WHERE version = ? AND position = ?，只删
+     "临时记录"这一条。剩余记录的 position 不重排
+     （release_notes.py:460-463 注释），库中剩余：
+       position 0 → 新增预览
+       position 2 → 改善提示\n保留换行（两行文本，一条记录）
+       position 3 → 新增预览
+     展示顺序由读取处的 ORDER BY position 决定
+     （read_draft，release_notes.py:130-137），position 空洞
+     不影响展示序号：删除后按当前展示序号重新数，共三条记录，
+     序号为 1、2、3。
+
+  e) 结果（release_notes.py:471）：标准输出恰为
+       Removed change: demo-0.2 #2
+     末尾带一个换行（print 行为），退出码 0（return 0 经
+     main/sys.exit，release_notes.py:739-749），标准错误为空。
+
+====================================================================
+3. 第二步：move-change demo-0.2 --from 02 --to 03
+====================================================================
+
+命令（[公开约定]：move-change 按展示顺序移动一条变更；--from
+为来源序号，--to 为目标序号且"表示移动后的最终位置"，两者均
+必填、仅允许一个、只接受数字且数值大于 0、前导零不影响定位，
+release_notes.py:692-714）：
+
+  python release_notes.py --db drafts.db move-change demo-0.2 --from 02 --to 03
+
+[静态推演] 源码路径逐步对应：
+
+  a) 输入校验（cmd_move_change，release_notes.py:475-483）：
+     --from 与 --to 各恰好一个；validate_change_index 把 "02"
+     规范化为 "2"、"03" 规范化为 "3"（lstrip("0")，
+     release_notes.py:279）。前导零只影响输入写法，定位与输出
+     中的序号均不保留前导零。版本名非空白。校验同样全部发生在
+     连接数据库之前（release_notes.py:476-479 注释）。
+
+  b) 草稿查找：open_draft_for_update 确认版本存在
+     （release_notes.py:485-487）。
+
+  c) 序号判断（release_notes.py:490-500）：先定位来源再定位
+     目标。当前共 3 条记录，from "2" 与 to "3" 均在界内：
+     来源是展示顺序第 2 条（两行文本"改善提示\n保留换行"，
+     其 position 为 2），目标是展示顺序第 3 条（position 为 3
+     的"新增预览"）。
+
+  d) 移动写入（release_notes.py:502-519）：按 ORDER BY position
+     取出全部记录的 id，在 Python 侧重排：
+       重排前 id 序列：[新增预览(pos0), 两行文本(pos2), 新增预览(pos3)]
+       ids.pop(2 - 1) 取出两行文本（release_notes.py:514）
+       ids.insert(3 - 1, ...) 把它插到最终第 3 位
+                       （release_notes.py:515）
+       重排后 id 序列：[新增预览(pos0), 新增预览(pos3), 两行文本(pos2)]
+     随后 executemany 把新位置 0、1、2 一次性写回 position 列
+     （release_notes.py:516-519）。目标序号表示最终位置，不因
+     来源在前而减一（release_notes.py:502-505 注释）；来源与
+     目标相同则顺序保持不变。条目原文、条目数量、标题与其他
+     版本均不受影响，重复文本"新增预览"的两条记录仍分别保留。
+
+  e) 结果（release_notes.py:523）：标准输出恰为
+       Moved change: demo-0.2 #2 -> #3
+     末尾带一个换行，退出码 0，标准错误为空。注意输出中的
+     序号是去前导零后的规范化形式（#2、#3，而非 #02、#03）。
+
+移动后的展示顺序（三条记录）：
+  第 1 条：新增预览
+  第 2 条：新增预览
+  第 3 条：改善提示\n保留换行（完整两行文本，仍是一条记录）
+
+====================================================================
+4. 移动后查看结果：show 与 export-markdown 预期文本
+====================================================================
+
+以下均为 [静态推演]，依据 read_draft 的读取顺序
+（release_notes.py:130-137）与两个命令的逐字拼接规则。
+
+show（cmd_show，release_notes.py:144-154；每条变更前加 "- "，
+多行变更只在首行前加前缀，内部换行保留，release_notes.py:150
+注释）。预期标准输出（共 6 行，末尾恰有一个换行），退出码 0，
+标准错误为空：
+
+  Version: demo-0.2
+  Title: 预览版
+  - 新增预览
+  - 新增预览
+  - 改善提示
+  保留换行
+
+export-markdown（cmd_export_markdown，release_notes.py:210-228；
+固定格式："# " + 版本名 + 两个换行，标题 + 两个换行，每条变更
+"- " 前缀加一个换行，release_notes.py:221-224 注释与 225-227
+拼接）。预期标准输出（末尾恰有一个换行），退出码 0，标准错误
+为空：
+
+  # demo-0.2
+
+  预览版
+
+  - 新增预览
+  - 新增预览
+  - 改善提示
+  保留换行
+
+为什么记录数不等于输出行数：第三条记录是内含一个换行的单一
+记录（"改善提示\n保留换行"），show 与 export-markdown 都只在
+其首行前加 "- "，内部换行原样输出（release_notes.py:150-153、
+225-227）。因此 3 条记录在 show 中占 4 行条目文本（连版本行、
+标题行共 6 行），在 export-markdown 中同样多出一行。序号按
+记录计数、不按行计数（locate_change 文档字符串，
+release_notes.py:365-366）。
+
+为什么新进程仍读到相同顺序：移动结果已作为 position 列的新值
+提交进 SQLite 文件（release_notes.py:516-519 的 UPDATE 在
+with conn 事务内，release_notes.py:489）；任何新进程读取时，
+read_draft 都按 ORDER BY position 取记录
+（release_notes.py:130-137），不依赖进程内缓存，因此同一数据
+库路径下顺序一致。
+
+====================================================================
+5. move-change 的错误优先级（[静态推演]，逐条对应源码）
+====================================================================
+
+校验严格分层，前一层未通过则不进入后一层：
+
+  第一层：输入校验（release_notes.py:480-483，发生在任何数据库
+    访问之前，即使数据库文件或版本不存在也优先报这条）。以下
+    任一情形输出 "Invalid draft"，退出码 1：
+      - 未提供 --from 或 --to（args.from_index / args.to_index
+        为 None，经 validate_change_index 判无效，
+        release_notes.py:275-276）；
+      - 重复提供任一序号选项（action="append" 使重复可被计数，
+        多于一个即 len != 1，release_notes.py:698-713 与
+        release_notes.py:275-276）；
+      - 版本名为空或仅含空白（is_blank，release_notes.py:42-44、
+        482）；
+      - 序号为空白字符串、含非 ASCII 数字（正则字符类 [0-9] 只
+        匹配 ASCII 数字，release_notes.py:277）、或数值为 0
+        （正则要求至少一位 1-9，release_notes.py:277）。
+
+  第二层：草稿查找（open_draft_for_update，
+    release_notes.py:282-315，仅在第一层通过后执行）。以下任一
+    情形输出 "Version not found: <版本名>"，退出码 1：
+      - 数据库文件不存在（os.path.exists 检查，
+        release_notes.py:291-292）；
+      - 文件存在但没有 drafts 表——完全空库或只有无关表
+        （release_notes.py:299-305）；
+      - 库中没有该版本名（含仅大小写不同的名称，按原文精确
+        匹配，release_notes.py:309-314）。
+
+  第三层：序号越界（release_notes.py:490-500，仅在版本存在后
+    执行）。先检查来源、后检查目标；来源越界输出
+    "Change not found: <版本名> #<来源规范化序号>"，目标越界
+    输出 "Change not found: <版本名> #<目标规范化序号>"，两者
+    都越界时报告来源（release_notes.py:490 注释）。退出码 1。
+    越界判定按序号文本与条目总数文本的位数及字典序比较
+    （locate_change，release_notes.py:376-385），极大序号不会
+    触发整数转换。
+
+所有失败的共同性质（[静态推演]）：
+  - 退出码 1：fail 返回 1（release_notes.py:47-50），经 main
+    返回、sys.exit 生效（release_notes.py:739-749）；
+  - 标准输出为空：失败路径不触碰 sys.stdout；
+  - 标准错误恰为错误文本加一个末尾换行：fail 用 print(...,
+    file=sys.stderr)（release_notes.py:49），只打印一次；
+  - 不创建数据库、不补建表：第一层校验在连接之前
+    （release_notes.py:476-483）；第二层先用 os.path.exists
+    挡住不存在的路径（release_notes.py:291），对已存在文件只
+    读 sqlite_master 判断表是否存在，全程无建表语句
+    （release_notes.py:296-298 注释）；
+  - 不改变已有内容：失败路径没有任何 INSERT/UPDATE/DELETE。
+
+remove-change 的错误分层与上述完全同构（第一层
+release_notes.py:440-442，第二层共用 open_draft_for_update，
+第三层 release_notes.py:449-453），另有一条独立规则：草稿只剩
+一条变更且请求删除该条时，输出
+"Cannot remove last change: <版本名>"，退出码 1，该记录原样
+保留（release_notes.py:455-458）；越界检查在此之前优先执行。
+
+====================================================================
+6. 边界与保留行为（[静态推演]）
+====================================================================
+
+  - 前导零只影响输入写法：validate_change_index 用 lstrip("0")
+    规范化（release_notes.py:279），"02" 与 "2" 定位同一记录，
+    成功输出与错误消息中的序号均为去零后的形式。
+  - 同位置移动成功且顺序不变：--from 与 --to 规范化后相同（如
+    --from 2 --to 2）时，pop 后插回原位，记录顺序、position
+    序列与内容均不变，仍输出 Moved change 并退出 0
+    （release_notes.py:502-505 注释、514-519）。
+  - 原文保留：移动只重写 position 列（release_notes.py:516-519），
+    不触碰 content；标题存于 drafts 表，移动不访问；其他版本
+    的记录因 WHERE version = ? 过滤不受影响
+    （release_notes.py:508-512）。
+  - 重复记录均保留：两条"新增预览"是 id 各自独立的记录，重排
+    按 id 进行（release_notes.py:506-519），不因文本相同而
+    合并或去重。
+  - 删除后的序号语义：remove-change 不重排剩余记录的 position
+    （release_notes.py:460-463 注释），但展示序号由读取处的
+    ORDER BY position 重新数出，因此本流程第 3 节的 --from 02
+    指向的是删除后三条记录中的第 2 条。
+
+====================================================================
+7. 推演声明
+====================================================================
+
+本说明全部预期结果（输出文本、退出码、数据库状态）均来自对
+release_notes.py 当前源码的静态阅读，未执行任何产品命令。凡
+源码未约定的情形（如数据库文件损坏、I/O 错误、并发写冲突的
+具体表现）未被推断为任何业务错误，也不在本说明覆盖范围内。
+若源码行号因后续修改漂移，以函数名（cmd_move_change、
+cmd_remove_change、validate_change_index、open_draft_for_update、
+locate_change、read_draft、cmd_show、cmd_export_markdown）为准
+重新定位。
