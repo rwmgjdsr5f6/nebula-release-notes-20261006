@@ -579,6 +579,17 @@ def cmd_rename_version(args):
 
     conn = sqlite3.connect(args.db)
     try:
+        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
+        # 无关表）与路径不存在等价，统一按原版本不存在处理，不补建
+        # drafts/changes、不更新任何记录，也不改动原有表结构与数据。此
+        # 查询只读 sqlite_master，不会开启写事务或产生 journal。
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'drafts'"
+        ).fetchone()
+        if has_table is None:
+            return fail(f"Version not found: {args.version}")
+
         try:
             with conn:
                 # 先确认原版本存在，再检查新名称冲突，避免给不存在的
