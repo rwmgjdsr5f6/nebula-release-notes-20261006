@@ -281,31 +281,16 @@ def cmd_add_change(args):
         return fail("Invalid draft")
     change = changes[0]
 
-    # add-change 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
-        return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
+    # 数据库文件、drafts 表与版本存在性检查与其他条目更新命令共用：
+    # 不创建数据库、不补建表，任一缺失统一按版本不存在处理。
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
     try:
-        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-        # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
-        # drafts/changes、不插入草稿，也不改动原有表结构与数据。此查询只
-        # 读 sqlite_master，不会开启写事务或产生 journal。
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master"
-            " WHERE type = 'table' AND name = 'drafts'"
-        ).fetchone()
-        if has_table is None:
-            return fail(f"Version not found: {args.version}")
-
         with conn:
-            # 先确认草稿存在，再计算新条目位置，避免给不存在的版本补建条目。
-            exists = conn.execute(
-                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
-            ).fetchone()
-            if exists is None:
-                return fail(f"Version not found: {args.version}")
-
+            # 版本存在性已在共用流程确认；新条目位置按现存最大 position
+            # 加一计算，即使草稿曾删除中间或末尾条目也仍落在所有现存
+            # 条目之后。
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), -1) FROM changes"
                 " WHERE version = ?",
@@ -342,7 +327,7 @@ def validate_change_index(indexes):
 
 
 def open_draft_for_update(db_path, version):
-    """为 set-change / remove-change / move-change 打开已有数据库并确认版本存在。
+    """为 add-change / set-change / remove-change / move-change 打开已有数据库并确认版本存在。
 
     不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
     （完全空库或只有无关表）即视为版本不存在。成功时返回
