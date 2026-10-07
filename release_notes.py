@@ -236,9 +236,9 @@ def cmd_set_title(args):
         return fail("Invalid draft")
 
     # 文件存在性、drafts 表存在性与版本存在性检查复用 set-title /
-    # add-change / set-change / remove-change / move-change 共用的草稿
-    # 访问流程：不创建数据库、不补建表、不改动原有表与数据，失败信息已
-    # 写入 stderr。
+    # add-change / set-change / remove-change / move-change / rename-version
+    # 共用的草稿访问流程：不创建数据库、不补建表、不改动原有表与数据，
+    # 失败信息已写入 stderr。
     conn, error = open_draft_for_update(args.db, args.version)
     if conn is None:
         return error
@@ -280,8 +280,8 @@ def validate_change_index(indexes):
 
 
 def open_draft_for_update(db_path, version):
-    """为 set-title / add-change / set-change / remove-change / move-change
-    打开已有数据库并确认版本存在。
+    """为 set-title / add-change / set-change / remove-change / move-change /
+    rename-version 打开已有数据库并确认版本存在。
 
     不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
     （完全空库或只有无关表）即视为版本不存在。成功时返回
@@ -329,9 +329,9 @@ def cmd_add_change(args):
     change = changes[0]
 
     # 文件存在性、drafts 表存在性与版本存在性检查复用 set-title /
-    # add-change / set-change / remove-change / move-change 共用的草稿
-    # 访问流程：不创建数据库、不补建表、不改动原有表与数据，失败信息已
-    # 写入 stderr。
+    # add-change / set-change / remove-change / move-change / rename-version
+    # 共用的草稿访问流程：不创建数据库、不补建表、不改动原有表与数据，
+    # 失败信息已写入 stderr。
     conn, error = open_draft_for_update(args.db, args.version)
     if conn is None:
         return error
@@ -539,33 +539,18 @@ def cmd_rename_version(args):
         return fail("Invalid draft")
     new_version = to_names[0]
 
-    # rename-version 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
-        return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
+    # 文件存在性、drafts 表存在性与原版本存在性检查复用 set-title /
+    # add-change / set-change / remove-change / move-change / rename-version
+    # 共用的草稿访问流程：不创建数据库、不补建表、不改动原有表与数据，
+    # 失败信息已写入 stderr。
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
     try:
-        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-        # 无关表）与路径不存在等价，统一按原版本不存在处理，不补建
-        # drafts/changes、不更新任何记录，也不改动原有表结构与数据。此
-        # 查询只读 sqlite_master，不会开启写事务或产生 journal。
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master"
-            " WHERE type = 'table' AND name = 'drafts'"
-        ).fetchone()
-        if has_table is None:
-            return fail(f"Version not found: {args.version}")
-
         try:
             with conn:
-                # 先确认原版本存在，再检查新名称冲突，避免给不存在的
-                # 版本补建记录或误报冲突。
-                exists = conn.execute(
-                    "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
-                ).fetchone()
-                if exists is None:
-                    return fail(f"Version not found: {args.version}")
-
+                # 原版本存在性已由共用流程确认；这里只检查新名称冲突，
+                # 避免误报冲突或改动其他版本的数据。
                 # 原名与新名完全相同（按原文逐字符比较，区分大小写）时
                 # 按成功处理：不更新、不新增任何记录。
                 if new_version != args.version:
