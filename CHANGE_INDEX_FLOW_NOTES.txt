@@ -1,0 +1,512 @@
+================================================================================
+删除变更后的序号变化与后续修订定位 —— 源码核对说明（纯文本，静态核对）
+================================================================================
+
+核对日期：2026-10-07
+仓库目录：/mnt/c/NebulaForge/projects/forge13/solverB/task018
+交付性质：本次仅新增本文件。未改动产品代码、数据库结构、已有文档
+          （README.md、DRAFT_FLOW_NOTES.txt、
+           DRAFT_FLOW_DEMO_NOTES.txt、.gitignore 均保持原样），
+          也不改变任何命令的行为；tests/ 下六个测试文件同样未改、未运行。
+核对方法：只阅读 README.md 与 release_notes.py，按代码路径静态推演；
+          未执行 release_notes.py，未运行测试或任何脚本，未创建
+          notes.sqlite。下文所有“预期输出 / 预期退出码”均为按源码静态
+          推演的结果，不是运行实测值；凡给出命令处均按“准备命令 /
+          预期结果”表述，不写成已执行。
+
+证据材料（git ls-files 核对，共 12 个被跟踪文件）：
+  - README.md            公开使用文档（371 行）
+  - release_notes.py     唯一源码（530 行），命令行入口与全部业务逻辑
+  - .gitignore           数据库文件忽略规则（*.sqlite 等）
+  - DRAFT_FLOW_NOTES.txt、DRAFT_FLOW_DEMO_NOTES.txt
+                         既有同类核对笔记，仅参考体例，不把其中结论当
+                         证据；本说明每个结论重新从 README.md 与
+                         release_notes.py 取证。
+  - tests/ 下六个测试文件：存在但本次不运行、不作为证据来源。
+
+引用格式：README.md:行号、release_notes.py:行号（行号对应当前版本）。
+标注约定：
+  【公开约定】可直接在 README.md 逐条核对到的对外承诺。
+  【源码推演】README 未逐字写明、但由 release_notes.py 的实现可直接
+              推出的行为（如存储 position 出现空位、大序号按位数比较）。
+
+流程范围：固定草稿 demo-0.1 的一次 remove-change 与一次 set-change，
+          删除后 show 的完整预期文本，以及同一流程上四个失败消息的
+          优先级。不涉及 create 的查重分支、list-drafts、export-markdown、
+          set-title，也不涉及并发写入。
+
+固定草稿（本说明全程使用这一份数据，库文件固定为 notes.sqlite）：
+  版本名：demo-0.1
+  标题：  预览版
+  变更（按传入顺序）：
+    第 1 条：新增预览
+    第 2 条：新增预览   （与第 1 条文本相同的重复记录）
+    第 3 条：改善提示
+
+
+--------------------------------------------------------------------------------
+零、相关实现位置速查
+--------------------------------------------------------------------------------
+
+  数据库结构（SCHEMA）            release_notes.py:25-37
+    drafts(version TEXT PRIMARY KEY, title TEXT NOT NULL)
+    changes(id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version TEXT NOT NULL, position INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            FOREIGN KEY(version) REFERENCES drafts(version))
+  空白判定 is_blank               release_notes.py:40-42
+  统一失败出口 fail               release_notes.py:45-48
+                                  （print 到 sys.stderr，返回 1）
+  create 写入（enumerate 定序号） release_notes.py:81-88
+  共用读取 read_draft             release_notes.py:99-130
+                                  （ORDER BY position，119-126）
+  show 拼装                       release_notes.py:133-143
+  add-change 追加位置             release_notes.py:256-266
+                                  （MAX(position) + 1）
+  序号校验 validate_change_index  release_notes.py:274-288
+  打开并确认版本 open_draft_for_update
+                                  release_notes.py:291-310
+  按展示序号定位 locate_change    release_notes.py:313-340
+  set-change 主流程               release_notes.py:343-381
+  remove-change 主流程            release_notes.py:384-420
+  子命令参数注册                  release_notes.py:423-517
+  入口 main（UTF-8、分发、退出码）release_notes.py:520-530
+
+
+--------------------------------------------------------------------------------
+一、准备：创建固定草稿（完整准备命令）
+--------------------------------------------------------------------------------
+
+在仓库目录下，用以下命令准备本说明使用的固定草稿（README.md:20-21
+的公开用法；所有示例都从 python release_notes.py --db notes.sqlite
+进入）：
+
+  python release_notes.py --db notes.sqlite create demo-0.1 \
+    --title "预览版" \
+    --change "新增预览" \
+    --change "新增预览" \
+    --change "改善提示"
+
+按源码静态推演（cmd_create，release_notes.py:51-96）：
+  (1) 校验全部通过：版本名非空白、标题非 None 且非空白、三条变更非空
+      且逐条非空白（release_notes.py:57-64；is_blank 见 40-42）。
+  (2) 连接 notes.sqlite（不存在则在此刻新建）并执行 SCHEMA
+      （release_notes.py:66-68，CREATE TABLE IF NOT EXISTS）。
+  (3) 同事务内写入 drafts 一行、changes 三行；三条变更的 position 由
+      enumerate(changes) 从 0 起生成（release_notes.py:81-88，关键在
+      :86）：
+        drafts : ("demo-0.1", "预览版")
+        changes: ("demo-0.1", position=0, "新增预览")
+                 ("demo-0.1", position=1, "新增预览")
+                 ("demo-0.1", position=2, "改善提示")
+  (4) 预期结果（静态推演，未实测）：退出码 0；标准输出恰为一行
+      "Created demo-0.1" 加末尾换行（print，release_notes.py:95）；
+      标准错误为空。与 README.md:29 的公开约定一致。
+
+【公开约定】重复内容分别保留、按传入顺序保存（README.md:24-25）；
+版本名、标题、条目原文保存，不裁剪不转义（README.md:26-27）；版本名
+精确匹配、区分大小写（README.md:28）。
+【源码推演】展示序号从 1 开始对人，存储 position 从 0 开始对库：创建后
+第 1/2/3 条分别对应 position 0/1/2。两条“新增预览”是各自独立的行，
+任何命令都不按内容去重（写入为 executemany，release_notes.py:81-88）。
+
+
+--------------------------------------------------------------------------------
+二、第一步操作：remove-change demo-0.1 --index 02
+--------------------------------------------------------------------------------
+
+命令（README.md:175-177 的公开用法）：
+
+  python release_notes.py --db notes.sqlite remove-change demo-0.1 --index 02
+
+按源码逐阶段推演（cmd_remove_change，release_notes.py:384-420）：
+
+  阶段 0 参数检查（访问数据库之前）
+  (1) --index 经 argparse append 收集为 ["02"]。
+  (2) validate_change_index（release_notes.py:274-288）：只允许一个
+      序号（:284-285）；正则 0*[1-9][0-9]*（:286）匹配 "02"
+      （前导零后有非零数字 2）；lstrip("0") 去前导零（:288），
+      返回 index_text = "2"。
+  (3) 版本名 "demo-0.1" 非空白、index_text 非 None，检查通过
+      （release_notes.py:388-390）。此阶段不访问文件系统。
+
+  阶段 1 定位版本（open_draft_for_update，release_notes.py:291-310）
+  (4) os.path.exists 命中 notes.sqlite（:298），连接库（:301）；
+      SELECT 1 FROM drafts WHERE version = ? 在 :304-306 取到行，
+      版本存在，返回该连接。
+
+  阶段 2 定位条目（locate_change，release_notes.py:313-340）
+  (5) SELECT COUNT(*) ... WHERE version = 'demo-0.1' 得 3
+      （release_notes.py:320-323）。
+  (6) 越界判定按十进制字符串位数与字典序进行（release_notes.py:324-331）：
+      count_text="3"，index_text="2"，位数相同且 "2" <= "3"，未越界。
+  (7) SELECT position FROM changes WHERE version = ?
+      ORDER BY position LIMIT 1 OFFSET ?，OFFSET = int("2")-1 = 1
+      （release_notes.py:335-339）。按 position 升序跳过第 1 行后取
+      一行，命中 position = 1，即创建时的第二条记录（内容为
+      “新增预览”的重复行）。
+
+  阶段 3 删除前保护
+  (8) count = 3，不满足 count == 1（release_notes.py:405-406），
+      允许删除。
+
+  写入
+  (9) DELETE FROM changes WHERE version = ? AND position = ?，
+      绑定 ("demo-0.1", 1)（release_notes.py:412-415）。with conn
+      事务正常退出时提交（release_notes.py:396）。
+  (10) print(f"Removed change: {args.version} #{index_text}")
+      （release_notes.py:419），return 0（:420）。
+
+预期结果（静态推演，未实测）：
+  退出码：0
+  标准输出（恰为一行，末尾一个换行）：
+    Removed change: demo-0.1 #2
+  标准错误：空
+  与 README.md:187-188 的公开约定一致。注意输出序号用的是去前导零后的
+  "2"（index_text），不是命令行原文 "02"；README.md:182-184 明确
+  “前导零不影响定位，输出与错误消息中的序号不保留前导零”。
+
+为什么只删掉第二条“新增预览”，第一条同名记录保留：
+  - 定位按“展示顺序中的第 N 条记录”进行，与内容无关：OFFSET 1 取的是
+    ORDER BY position 排序后的第二行（release_notes.py:335-339），
+    不是按 content 匹配。
+  - DELETE 语句同时带 version 与 position 两个等值条件
+    （release_notes.py:412-415），只删除 position=1 这一行；
+    position=0 的同名行不满足条件，原样保留。
+  - 【公开约定】“相同文本的其他记录仍保留”（README.md:179-181）。
+
+删除后 changes 表中本版本剩余两行（【源码推演】，position 不重排）：
+    ("demo-0.1", position=0, "新增预览")
+    ("demo-0.1", position=2, "改善提示")
+  position=1 成为空位。release_notes.py:408-411 注释明示：“剩余条目的
+  position 不重排：展示顺序由 ORDER BY position 决定，删除后的序号按
+  剩余记录重新计算，追加仍落在末尾（MAX(position) + 1）。”
+
+
+--------------------------------------------------------------------------------
+三、第二步操作：set-change demo-0.1 --index 2 --change "修订提示"
+--------------------------------------------------------------------------------
+
+命令（README.md:148-150 的公开用法）：
+
+  python release_notes.py --db notes.sqlite set-change demo-0.1 \
+    --index 2 --change "修订提示"
+
+按源码逐阶段推演（cmd_set_change，release_notes.py:343-381）：
+
+  阶段 0 参数检查（访问数据库之前）
+  (1) --change 恰有一条且非空白、版本名非空白；validate_change_index
+      对 ["2"] 校验通过，index_text = "2"（release_notes.py:348-357；
+      校验逻辑同二、(2)）。
+
+  阶段 1 定位版本
+  (2) open_draft_for_update 成功：文件存在、drafts 中有 demo-0.1
+      （release_notes.py:359-361；实现见 291-310）。
+
+  阶段 2 定位条目（此时上一步删除已提交）
+  (3) COUNT(*) 得 2（release_notes.py:320-323）；"2" <= "2"，未越界
+      （release_notes.py:324-331）。
+  (4) ORDER BY position LIMIT 1 OFFSET 1（release_notes.py:335-339）：
+      剩余两行按 position 升序为 position=0、position=2，跳过第一行
+      后取到 position = 2，即内容“改善提示”那一行。
+      ——这正是“后续修订如何定位条目”的答案：删除后请求序号 2，
+      命中的不是已删除的旧第二条，而是剩余记录中的第二条
+      （存储上是 position=2）。
+
+  写入
+  (5) UPDATE changes SET content = ? WHERE version = ? AND position = ?
+      绑定 ("修订提示", "demo-0.1", 2)（release_notes.py:372-376）。
+      只改这一行的 content；该行 position 不变，条目数量与排列不变
+      （注释见 release_notes.py:370-371）。
+  (6) print(f"Updated change: {args.version} #{index_text}")
+      （release_notes.py:380），return 0（:381）。
+
+预期结果（静态推演，未实测）：
+  退出码：0
+  标准输出（恰为一行，末尾一个换行）：
+    Updated change: demo-0.1 #2
+  标准错误：空
+  与 README.md:160-162 的公开约定一致。
+
+
+--------------------------------------------------------------------------------
+四、后续 show 的完整预期文本
+--------------------------------------------------------------------------------
+
+命令（README.md:38-40 的公开用法；可在新进程中执行）：
+
+  python release_notes.py --db notes.sqlite show demo-0.1
+
+read_draft（release_notes.py:99-130）先取 drafts.title
+（release_notes.py:112-117，标题仍为“预览版”），再以
+SELECT content ... WHERE version = ? ORDER BY position 取条目
+（release_notes.py:119-126）：剩余两行按 position 0、2 升序，内容为
+“新增预览”“修订提示”。cmd_show 以 "Version: "、"Title: " 与每条
+"- " 拼装，"\n" 连接并在末尾补一个换行（release_notes.py:139-142）。
+
+预期标准输出（退出码 0，标准错误为空；整体末尾恰有一个换行）：
+
+  Version: demo-0.1
+  Title: 预览版
+  - 新增预览
+  - 修订提示
+
+即：标题不变；三条变经过“删第二条、把新第二条改写”后，只剩
+“新增预览”和“修订提示”两条，顺序为“新增预览”在前。格式与
+README.md:42-49 的公开约定一致。
+
+
+--------------------------------------------------------------------------------
+五、序号机制：展示序号、存储位置、多行文本与跨进程
+--------------------------------------------------------------------------------
+
+5.1 展示序号与存储位置的关系
+
+  - 存储位置 position：changes.position 列，创建时由 enumerate 从 0
+    起赋值（release_notes.py:86），一经写入不再被任何命令改写；
+    remove-change 只删除目标行、不重排剩余行（release_notes.py:408-415），
+    set-change 的 UPDATE 不带 position 赋值（release_notes.py:372-376）。
+  - 展示序号：从 1 开始的“当前展示顺序中的第 N 条”。读取一律
+    ORDER BY position（show 用 release_notes.py:119-126；定位用
+    release_notes.py:335-339），序号 N 被翻译成 OFFSET N-1
+    （release_notes.py:338），即“排序后跳过前 N-1 行取一行”。
+  - 因此删除后序号按剩余记录重新计算，是“读时重算”，不是“写时
+    重编号”：本例删除 position=1 后，原 position=2 的“改善提示”
+    自动成为展示第 2 条；随后 set-change --index 2 命中的正是它。
+  - 【公开约定】README.md:185-186：“删除后序号按剩余记录重新计算：
+    set-change 按新序号定位，add-change 仍追加到末尾。”
+  - 【源码推演】追加位置取 COALESCE(MAX(position), -1) + 1
+    （release_notes.py:256-266）。本例删除后最大 position 仍为 2，
+    下一次 add-change 会写入 position=3（展示上仍是第 3 条之前的
+    末尾位置：当前两条之后），position=1 的空位保留。展示序号连续
+    与存储 position 可以不连续，两件事互不矛盾。
+
+5.2 多行文本为何只占一个序号
+
+  - 每条 --change 插入 changes 的一行，文本（含内部换行）整体存于
+    一个 TEXT 列 content（release_notes.py:81-88）；换行是列值内部
+    的字符，不产生额外记录。
+  - locate_change 的计数是 SELECT COUNT(*)（release_notes.py:320-323），
+    定位是 LIMIT 1 OFFSET N-1（release_notes.py:335-339），二者都按
+    行计数，与 content 里有多少换行无关。
+  - 展示时每条记录只在整段文本前加一次 "- "，内部换行原样保留
+    （release_notes.py:139-141；read_draft 注释 103-105）。
+  - 【公开约定】README.md:51（show）、README.md:155-157（set-change）、
+    README.md:182-184（remove-change）：序号“按记录而非输出行数计数，
+    多行条目只占一个序号”。
+
+5.3 新进程读取同一数据库为何仍保持顺序
+
+  - 程序没有任何跨调用的内存状态：每次命令执行都新建 sqlite3 连接、
+    用完在 finally 中关闭（remove-change 的连接开/关于
+    release_notes.py:301、416-417；set-change 同构于 359-378；
+    read_draft 开/关于 110、127-128）。
+  - 删除与替换在 with conn 事务内执行，随 with 块正常退出提交
+    （release_notes.py:396、363）；提交后状态只存在于 notes.sqlite
+    文件。新进程用同一 --db 路径连接同一文件（README.md:14-16），
+    read_draft 仍按 ORDER BY position 读回（release_notes.py:119-126），
+    得到与上一进程结束时完全相同的条目与顺序。
+  - 【公开约定】README.md:14-16（之后的进程使用同一路径即可继续读取
+    与追加）、README.md:220（可在结束当前进程后于新进程用同一数据库
+    路径查看）。
+
+
+--------------------------------------------------------------------------------
+六、同一流程的失败优先级
+--------------------------------------------------------------------------------
+
+remove-change / set-change 的检查严格按“参数检查 → 定位版本 →
+定位条目 →（仅 remove-change）最后一条保护 → 写入”的顺序短路，
+前一阶段失败就不会进入后一阶段：
+
+  阶段 0 参数检查：失败消息 Invalid draft
+    remove-change：release_notes.py:388-390
+    set-change   ：release_notes.py:348-356
+    序号规则在 validate_change_index：release_notes.py:274-288
+  阶段 1 定位版本：失败消息 Version not found: <版本名>
+    open_draft_for_update：release_notes.py:298-299（文件不存在）、
+    304-309（版本行不存在）
+  阶段 2 定位条目：失败消息 Change not found: <版本名> #<序号>
+    remove-change：release_notes.py:397-401
+    set-change   ：release_notes.py:364-368
+  阶段 3 最后一条保护（仅 remove-change）：
+    失败消息 Cannot remove last change: <版本名>
+    release_notes.py:405-406
+  写入只可能发生在全部检查之后：
+    UPDATE release_notes.py:372-376；DELETE release_notes.py:412-415
+
+6.1 序号为 0：即使数据库不存在，也先报 Invalid draft
+
+  例（静态推演，未实测）：
+    python release_notes.py --db not-yet.sqlite remove-change demo-0.1 --index 0
+  - 序号正则为 0*[1-9][0-9]*（release_notes.py:286），"0" 中没有
+    非零数字，不匹配 → validate_change_index 返回 None
+    （release_notes.py:286-288）。
+  - cmd_remove_change 在 release_notes.py:389 即 fail("Invalid draft")，
+    发生在 open_draft_for_update（:392）之前，因此根本不会执行
+    os.path.exists 或 sqlite3.connect——数据库文件存不存在都不影响
+    结果，也不会新建文件。
+  - set-change 同理（release_notes.py:349-356 先于 :359）；此外
+    --index/--change 缺失或重复、版本名或新文本空白也在同一阶段报
+    Invalid draft。
+  - 【公开约定】README.md:189-191（remove-change）、
+    README.md:163-165（set-change）：即使目标版本不存在也优先返回
+    Invalid draft。
+
+6.2 序号合法，但数据库或版本不存在：Version not found: <版本名>
+
+  - 数据库文件不存在：open_draft_for_update 先 os.path.exists
+    （release_notes.py:298），不存在即 fail（:299）并返回，发生在
+    sqlite3.connect（:301）之前——不会创建空文件。
+  - 文件存在但 drafts 表中没有该版本行：SELECT 1 FROM drafts
+    取空（release_notes.py:304-307），在 :309 fail 返回；此后不会
+    去查 changes，更不会写入。
+  - 两种情况的消息相同：Version not found: <版本名>。
+  - 【公开约定】README.md:192-193、README.md:166-167。
+
+6.3 版本存在但序号越界：Change not found: <版本名> #<序号>
+
+  - locate_change 先 COUNT(*) 得当前条目数，再按十进制位数、同位时
+    按字符串字典序比较 index_text 与 count_text
+    （release_notes.py:320-333；大序号不转 int 是有意为之，注释见
+    :281-283、:317-319）。越界时返回 (count, None)，调用方报
+    Change not found（remove-change :398-401；set-change :365-368）。
+  - 消息中的序号是去前导零后的 index_text。
+  - 【公开约定】README.md:194-195、README.md:168-169。
+
+6.4 只剩一条记录时：序号 2 报越界，序号 1 才报 Cannot remove last
+
+  假设把本例草稿再删到只剩一条（仅用于说明优先级的静态推演状态），
+  COUNT(*) = 1，count_text = "1"：
+  - 请求 --index 2：位数相同，"2" <= "1" 不成立，locate_change
+    直接返回 None（release_notes.py:325-333），走 6.3 的分支，
+    报 "Change not found: demo-0.1 #2"。越界检查在最后一条保护
+    之前（release_notes.py:398 的判断先于 :405），所以不会报
+    Cannot remove last。
+  - 请求 --index 1："1" <= "1"，定位成功并返回那条记录的
+    position（release_notes.py:335-340）；随后 count == 1 命中
+    （release_notes.py:405），报 "Cannot remove last change: demo-0.1"
+    （:406），DELETE（:412-415）不执行，该记录原样保留。
+  - 【公开约定】README.md:196-197。set-change 没有这一保护：对唯一
+    一条记录做替换是允许的（其流程中不存在 count == 1 分支）。
+
+6.5 上述失败的共同结果（静态推演）
+
+  - 退出码均为 1：fail 固定返回 1（release_notes.py:45-48）。
+  - 标准输出均为空：这些失败路径在成功 print 之前 return，且此前没有
+    任何 stdout 写入（成功 print 位于 release_notes.py:419、
+    :380；失败只写 stderr）。
+  - 标准错误只含相应消息加末尾换行：fail 用
+    print(message, file=sys.stderr)（release_notes.py:47），print
+    自带一个换行；不输出 traceback 或其他内容。
+  - 不创建数据库：阶段 0 不碰文件系统；阶段 1 的文件不存在分支先于
+    connect（release_notes.py:298-301）。set-change/remove-change
+    全流程不执行 SCHEMA（SCHEMA 只在 create 的 release_notes.py:68
+    执行），对已存在文件也不会补建表。
+  - 不改动草稿：阶段 1 失败时只有 SELECT；阶段 2、阶段 3 失败时
+    with conn 块内尚未执行任何 INSERT/UPDATE/DELETE
+    （release_notes.py:397-406 在 :412 之前返回；:364-368 在
+    :372 之前返回），事务无内容可提交。
+  - 【公开约定】README.md:198-199、README.md:170-171：以上失败标准
+    输出为空、错误消息末尾带换行，不创建数据库或草稿、不改变已有
+    内容。
+
+
+--------------------------------------------------------------------------------
+七、标题、其他条目与其他版本保持不变的源码依据
+--------------------------------------------------------------------------------
+
+  - 标题不变：set-change 与 remove-change 的全部写操作只针对 changes
+    表（UPDATE release_notes.py:372-376；DELETE release_notes.py:412-415），
+    两条 SQL 均不涉及 drafts；标题来自 drafts.title，只在 read_draft
+    读取（release_notes.py:112-117）。本例 show 中标题保持“预览版”。
+    公开依据：README.md:152-154（替换不改标题）、README.md:179-181
+    （删除不影响标题）。
+  - 其他条目的原文与相对顺序不变：
+      * set-change 的 UPDATE 以 version + position 精确定位单行，只
+        赋 content（release_notes.py:372-376）；其他行不被匹配。
+      * remove-change 的 DELETE 同样以 version + position 限定单行
+        （release_notes.py:412-415）；存活行的 position 一个都不改，
+        ORDER BY position 读回时它们的相对先后与删除前一致
+        （release_notes.py:119-126、335-339）。本例 position=0 的
+        “新增预览”原文不变且仍排在最前。
+      * 相同文本的其他记录不靠内容区分，因此不会被连带删除或替换
+        （参见第二节；公开依据 README.md:154、179-181）。
+  - 其他版本不变：这两个命令的每条 SQL 都带 WHERE version = ? 并绑定
+    args.version（计数 release_notes.py:320-323、定位 :335-339、
+    更新 :372-376、删除 :412-415；版本确认 :304-306），不会匹配其他
+    version 的 drafts/changes 行；drafts 主键 version 也不被这两个
+    命令写入。公开依据：README.md:152-154、179-181。
+
+
+--------------------------------------------------------------------------------
+八、公开约定与源码推演的对照、以及本次不能确定的事项
+--------------------------------------------------------------------------------
+
+8.1 对照结论
+
+  本流程涉及的对外承诺均可逐条对应到实现，未发现矛盾：
+
+  公开约定（README.md）                  源码实现（release_notes.py）
+  ------------------------------------   ------------------------------
+  set-change 用法 148-150                参数注册 481-500
+  remove-change 用法 175-177             参数注册 502-515
+  序号从 1 起、按记录计数、前导零规则
+    155-157、182-184                     validate_change_index 274-288
+  替换不改数量/排列/标题/其他版本
+    152-154                              单行 UPDATE 372-376
+  删除后其他条目原文与相对顺序不变、
+    同文本记录保留 179-181               单行 DELETE、position 不重排
+                                         408-415
+  删除后序号按剩余记录重算、追加在末尾
+    185-186                              OFFSET N-1 定位 335-339；
+                                         MAX(position)+1 256-266
+  成功输出 Updated/Removed ... #N
+    160-162、187-188                     print 380、419
+  Invalid draft 优先 163-165、189-191    检查先于文件访问 348-356、
+                                         388-390
+  Version not found 166-167、192-193     exists 298、drafts 查询 304-309
+  Change not found 168-169、194-195      计数与越界判定 320-333
+  Cannot remove last 196-197             count == 1 在 DELETE 前 405-406
+  失败不建库、不改内容、stdout 空、
+    stderr 消息加换行 170-171、198-199   fail 45-48；connect 被
+                                         exists 拦截 298-301；写操作
+                                         在全部失败分支之后 372/412
+
+  属于【源码推演】、README 未逐字写明但实现可直接推出的细节：
+  - 存储 position 从 0 开始且删除后留空位，展示序号是读时按
+    ORDER BY position 重算的 1 基序数（release_notes.py:86、
+    119-126、335-339、408-411）；
+  - 越界判定按十进制位数 + 同位数字典序，避免极大序号转整数
+    （release_notes.py:320-333）；
+  - set-change/remove-change 从不执行建表语句（SCHEMA 仅在
+    release_notes.py:68 被 cmd_create 使用）。
+
+8.2 本次不能确定 / 超出范围
+
+  1. 本说明未执行任何命令：所有输出、退出码、删改后的库内容均为按
+     release_notes.py 当前文本的静态推演，不是实测结果；运行时的
+     Python/SQLite 具体版本与终端显示不在静态核对范围内。
+  2. 参数结构性缺失（不给 --db、不给子命令等）由 argparse 在
+     release_notes.py:525 解析阶段处理，退出码为 argparse 标准的 2，
+     不进入业务函数，也不属于本流程 0/1 两种退出码；此处仅记录区别。
+  3. 两个进程同时写同一库的竞争时机无法静态复现；本说明的“跨进程”
+     仅指前一进程结束后、新进程重开同一文件的情形。
+  4. 未覆盖 create 查重、set-title、add-change 成功路径、list-drafts、
+     export-markdown 的行为；需要时应另按源码取证，不沿用本说明结论
+     外推。
+
+================================================================================
+结论：在固定草稿 demo-0.1（标题“预览版”，三条为“新增预览 / 新增预览 /
+改善提示”）上，remove-change demo-0.1 --index 02 仅删除按展示顺序的
+第二条（position=1 的重复“新增预览”），原第三条以 position=2 成为新
+第二条；set-change demo-0.1 --index 2 --change "修订提示" 即按新序号
+命中该行并替换。两次操作预期退出码均为 0、stderr 为空，stdout 分别为
+"Removed change: demo-0.1 #2" 与 "Updated change: demo-0.1 #2"，
+各带末尾换行；随后 show 的标题仍为“预览版”，只剩“新增预览”与
+“修订提示”两条。失败消息严格按 Invalid draft → Version not found →
+Change not found →（仅删除）Cannot remove last change 的优先级短路，
+全部退出 1、stdout 为空、stderr 仅消息加换行，不建库、不改草稿。
+以上每项均附 release_notes.py 函数与行号，并区分了【公开约定】与
+【源码推演】；全部为静态推演，未把未执行的命令写成实测结果。
+================================================================================
