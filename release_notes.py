@@ -105,12 +105,26 @@ def read_draft(db_path, version):
     大小写不同）时返回 None；否则返回 (标题原文, 变更原文列表)，变更
     按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行
     变更仍是一条记录。
+
+    文件存在但库内没有 drafts 表（不含任何表，或只有无关表）时与空库
+    等价，同样返回 None：不补建 drafts/changes 表，也不触碰库内其他
+    表与数据。
     """
     if not os.path.exists(db_path):
         return None
 
     conn = sqlite3.connect(db_path)
     try:
+        # 不执行任何建表语句：先查 sqlite_master 确认 drafts 表存在，
+        # 表不存在时按版本不存在处理，避免把“no such table”异常暴露
+        # 给 show / export-markdown，也不改变库内任何结构。
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'drafts'"
+        ).fetchone()
+        if has_table is None:
+            return None
+
         row = conn.execute(
             "SELECT title FROM drafts WHERE version = ?", (version,)
         ).fetchone()
