@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持八个操作：
+支持九个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
   list-drafts     列出全部已保存草稿的版本名与标题
@@ -9,6 +9,7 @@
   add-change      向已有草稿追加一条变更
   set-change      按展示顺序替换已有草稿的一条变更
   remove-change   按展示顺序删除已有草稿的一条变更
+  move-change     按展示顺序移动单条变更的位置
   export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
 
 不提供版本重命名、发布或 Git 相关功能；Markdown 导出只写到标准输出，
@@ -420,6 +421,66 @@ def cmd_remove_change(args):
     return 0
 
 
+def cmd_move_change(args):
+    # --from 与 --to 各允许一个：未提供（None）或重复提供（多于一个）都
+    # 视为无效草稿；版本名非空白；两个序号只接受数字 0-9 组成且数值大于
+    # 0 的字符串。校验全部发生在访问数据库之前，即使版本不存在也优先报
+    # Invalid draft，失败时不会新建数据库文件。
+    from_text = validate_change_index(args.source or [])
+    to_text = validate_change_index(args.target or [])
+    if is_blank(args.version) or from_text is None or to_text is None:
+        return fail("Invalid draft")
+
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
+    try:
+        with conn:
+            # 版本存在后先检查来源再检查目标：两者都越界时报告来源。
+            # 只取定位结果的第二项（position），越界时为 None。
+            if locate_change(conn, args.version, from_text)[1] is None:
+                return fail(
+                    f"Change not found: {args.version} #{from_text}"
+                )
+            if locate_change(conn, args.version, to_text)[1] is None:
+                return fail(
+                    f"Change not found: {args.version} #{to_text}"
+                )
+
+            # 两个序号都按操作前的展示顺序从 1 开始计数：先取出按
+            # position 升序排列的记录主键，在 Python 侧完成“取出后插入”，
+            # 目标序号直接作为插入位置，不因来源在前而减一；来源与目标
+            # 相同时列表天然不变。多行文本只占一个序号。
+            ordered_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM changes WHERE version = ?"
+                    " ORDER BY position",
+                    (args.version,),
+                )
+            ]
+            from_index = int(from_text) - 1
+            to_index = int(to_text) - 1
+            if from_index != to_index:
+                # pop + insert 后所选条目恰好落在目标序号，其余条目的
+                # 相对顺序不变。按唯一主键 id 重写 position：若按旧
+                # position 逐条更新，过程中会与已改过的位置碰撞；只涉及
+                # 该版本，条目的原文与数量均不改变。
+                ordered_ids.insert(to_index, ordered_ids.pop(from_index))
+                conn.executemany(
+                    "UPDATE changes SET position = ? WHERE id = ?",
+                    [
+                        (new_position, row_id)
+                        for new_position, row_id in enumerate(ordered_ids)
+                    ],
+                )
+    finally:
+        conn.close()
+
+    print(f"Moved change: {args.version} #{from_text} -> #{to_text}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -513,6 +574,31 @@ def build_parser():
         "只接受数字且数值大于 0，前导零不影响定位",
     )
     parser_remove_change.set_defaults(func=cmd_remove_change)
+
+    parser_move_change = subparsers.add_parser(
+        "move-change", help="按展示顺序移动单条变更的位置"
+    )
+    parser_move_change.add_argument(
+        "version", help="版本名，按原文精确匹配，区分大小写"
+    )
+    parser_move_change.add_argument(
+        "--from",
+        dest="source",
+        action="append",
+        metavar="N",
+        help="来源序号（必填且仅允许一个），按操作前的展示顺序从 1 开始"
+        "按记录计数；只接受数字且数值大于 0，前导零不影响定位",
+    )
+    parser_move_change.add_argument(
+        "--to",
+        dest="target",
+        action="append",
+        metavar="N",
+        help="目标序号（必填且仅允许一个），表示移动后的最终位置，按操作"
+        "前的展示顺序从 1 开始计数；只接受数字且数值大于 0，前导零不"
+        "影响定位",
+    )
+    parser_move_change.set_defaults(func=cmd_move_change)
 
     return parser
 
