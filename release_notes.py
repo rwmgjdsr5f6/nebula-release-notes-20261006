@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持九个操作：
+支持十个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
   list-drafts     列出全部已保存草稿的版本名与标题
@@ -10,9 +10,10 @@
   set-change      按展示顺序替换已有草稿的一条变更
   remove-change   按展示顺序删除已有草稿的一条变更
   move-change     按展示顺序移动已有草稿的一条变更
+  rename-version  重命名已有草稿的版本名（标题与变更随版本名一起保留）
   export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
 
-不提供版本重命名、发布或 Git 相关功能；Markdown 导出只写到标准输出，
+不提供发布或 Git 相关功能；Markdown 导出只写到标准输出，
 命令本身不接收输出路径，也不创建发布说明文件。
 """
 
@@ -493,6 +494,69 @@ def cmd_move_change(args):
     return 0
 
 
+def cmd_rename_version(args):
+    # 仅允许一个 --to：未提供（None）、显式给出却缺值（nargs='?' 落空时
+    # 取空串常量）或重复提供（多于一个）都视为无效草稿。原版本名与新
+    # 版本名均非空白。校验全部发生在访问数据库之前，即使数据库文件或
+    # 原版本不存在也优先报 Invalid draft，失败时不会新建数据库文件。
+    to_names = args.to
+    if (
+        is_blank(args.version)
+        or to_names is None
+        or len(to_names) != 1
+        or is_blank(to_names[0])
+    ):
+        return fail("Invalid draft")
+    new_version = to_names[0]
+
+    # rename-version 不创建数据库：文件不存在即视为版本不存在。
+    if not os.path.exists(args.db):
+        return fail(f"Version not found: {args.version}")
+
+    conn = sqlite3.connect(args.db)
+    try:
+        try:
+            with conn:
+                # 先确认原版本存在，再检查新名称冲突，避免给不存在的
+                # 版本补建记录或误报冲突。
+                exists = conn.execute(
+                    "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
+                ).fetchone()
+                if exists is None:
+                    return fail(f"Version not found: {args.version}")
+
+                # 原名与新名完全相同（按原文逐字符比较，区分大小写）时
+                # 按成功处理：不更新、不新增任何记录。
+                if new_version != args.version:
+                    conflict = conn.execute(
+                        "SELECT 1 FROM drafts WHERE version = ?",
+                        (new_version,),
+                    ).fetchone()
+                    if conflict is not None:
+                        return fail(f"Version already exists: {new_version}")
+
+                    # 同一事务内更新草稿行与全部变更行的版本名：标题、
+                    # 变更原文、条目数量与展示顺序（position）原样保留，
+                    # 重复文本的各条记录仍分别保留，其他版本不受影响。
+                    # 新名称按原文原样保存，不裁剪空白、不转义。
+                    conn.execute(
+                        "UPDATE drafts SET version = ? WHERE version = ?",
+                        (new_version, args.version),
+                    )
+                    conn.execute(
+                        "UPDATE changes SET version = ? WHERE version = ?",
+                        (new_version, args.version),
+                    )
+        except sqlite3.IntegrityError:
+            # 兜底：并发进程抢先创建同名版本时，事务回滚不留部分重命名。
+            return fail(f"Version already exists: {new_version}")
+    finally:
+        conn.close()
+
+    print(f"Renamed version: {args.version} -> {new_version}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -623,6 +687,26 @@ def build_parser():
         "计数规则与来源序号相同",
     )
     parser_move_change.set_defaults(func=cmd_move_change)
+
+    parser_rename_version = subparsers.add_parser(
+        "rename-version", help="重命名已有草稿的版本名，标题与变更随版本名保留"
+    )
+    parser_rename_version.add_argument(
+        "version", help="原版本名，按原文精确匹配，区分大小写"
+    )
+    # action="append" 使重复提供可被计数（多于一个即无效）；nargs='?' 配合
+    # const="" 让显式给出却缺值的 --to 以空串进入处理函数而非触发 argparse
+    # 自带报错，从而统一报 Invalid draft（退出码 1）。值不设 default，省略
+    # 时为 None，同样视为无效。
+    parser_rename_version.add_argument(
+        "--to",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="新版本名（必填且仅允许一个），按原文原样保存，不裁剪空白",
+    )
+    parser_rename_version.set_defaults(func=cmd_rename_version)
 
     return parser
 
