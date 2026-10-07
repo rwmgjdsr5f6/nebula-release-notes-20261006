@@ -101,7 +101,8 @@ def cmd_create(args):
 def read_draft(db_path, version):
     """按版本名原文精确读取草稿，供 show 与 export-markdown 共用。
 
-    只读操作，不创建数据库：数据库文件不存在或库内没有该版本（含仅
+    只读操作，不创建数据库、不补建表：数据库文件不存在、文件存在但
+    没有 drafts 表（完全空库或只有无关表）、或库内没有该版本（含仅
     大小写不同）时返回 None；否则返回 (标题原文, 变更原文列表)，变更
     按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行
     变更仍是一条记录。
@@ -111,6 +112,14 @@ def read_draft(db_path, version):
 
     conn = sqlite3.connect(db_path)
     try:
+        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
+        # 无关表）与空目录等价，按版本不存在处理，不补建 drafts/changes。
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'drafts'"
+        ).fetchone()
+        if has_table is None:
+            return None
         row = conn.execute(
             "SELECT title FROM drafts WHERE version = ?", (version,)
         ).fetchone()
