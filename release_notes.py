@@ -241,6 +241,16 @@ def cmd_set_title(args):
 
     conn = sqlite3.connect(args.db)
     try:
+        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
+        # 无关表）与版本不存在等价，不补建 drafts/changes、不插入草稿，
+        # 也不改动原有表结构和数据。
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master"
+            " WHERE type = 'table' AND name = 'drafts'"
+        ).fetchone()
+        if has_table is None:
+            return fail(f"Version not found: {args.version}")
+
         # 单条 UPDATE 天然幂等：标题相同则匹配但不改变任何内容，
         # 不会新增草稿或变更条目；版本不存在时 rowcount 为 0。
         with conn:
