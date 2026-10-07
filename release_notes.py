@@ -342,7 +342,7 @@ def validate_change_index(indexes):
 
 
 def open_draft_for_update(db_path, version):
-    """为 remove-change / move-change 打开已有数据库并确认版本存在。
+    """为 set-change / remove-change / move-change 打开已有数据库并确认版本存在。
 
     不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
     （完全空库或只有无关表）即视为版本不存在。成功时返回
@@ -422,31 +422,11 @@ def cmd_set_change(args):
         return fail("Invalid draft")
     change = changes[0]
 
-    # set-change 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
-        return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
     try:
-        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-        # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
-        # drafts/changes、不插入草稿，也不改动原有表结构与数据。此查询只
-        # 读 sqlite_master，不会开启写事务或产生 journal。
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master"
-            " WHERE type = 'table' AND name = 'drafts'"
-        ).fetchone()
-        if has_table is None:
-            return fail(f"Version not found: {args.version}")
-
         with conn:
-            # 先确认草稿存在，再定位条目，避免给不存在的版本误报条目越界。
-            exists = conn.execute(
-                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
-            ).fetchone()
-            if exists is None:
-                return fail(f"Version not found: {args.version}")
-
             _, target_position = locate_change(conn, args.version, index_text)
             if target_position is None:
                 return fail(
