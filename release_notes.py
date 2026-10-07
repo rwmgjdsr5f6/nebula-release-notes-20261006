@@ -268,62 +268,6 @@ def cmd_set_title(args):
     return 0
 
 
-def cmd_add_change(args):
-    # 仅允许一条 --change：未提供（None）或重复提供（多于一条）都视为无效草稿。
-    # 名称、追加文本非空白。校验发生在访问数据库之前，即使版本不存在也优先
-    # 报 Invalid draft，失败时不会新建数据库文件。
-    changes = args.change or []
-    if (
-        is_blank(args.version)
-        or len(changes) != 1
-        or is_blank(changes[0])
-    ):
-        return fail("Invalid draft")
-    change = changes[0]
-
-    # add-change 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
-        return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
-    try:
-        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-        # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
-        # drafts/changes、不插入草稿，也不改动原有表结构与数据。此查询只
-        # 读 sqlite_master，不会开启写事务或产生 journal。
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master"
-            " WHERE type = 'table' AND name = 'drafts'"
-        ).fetchone()
-        if has_table is None:
-            return fail(f"Version not found: {args.version}")
-
-        with conn:
-            # 先确认草稿存在，再计算新条目位置，避免给不存在的版本补建条目。
-            exists = conn.execute(
-                "SELECT 1 FROM drafts WHERE version = ?", (args.version,)
-            ).fetchone()
-            if exists is None:
-                return fail(f"Version not found: {args.version}")
-
-            row = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) FROM changes"
-                " WHERE version = ?",
-                (args.version,),
-            ).fetchone()
-            next_position = row[0] + 1
-            conn.execute(
-                "INSERT INTO changes(version, position, content)"
-                " VALUES (?, ?, ?)",
-                (args.version, next_position, change),
-            )
-    finally:
-        conn.close()
-
-    print(f"Added change: {args.version}")
-    return 0
-
-
 def validate_change_index(indexes):
     """校验 set-change / remove-change 共用的 --index 列表。
 
@@ -342,7 +286,7 @@ def validate_change_index(indexes):
 
 
 def open_draft_for_update(db_path, version):
-    """为 set-change / remove-change / move-change 打开已有数据库并确认版本存在。
+    """为 add-change / set-change / remove-change / move-change 打开已有数据库并确认版本存在。
 
     不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
     （完全空库或只有无关表）即视为版本不存在。成功时返回
@@ -355,8 +299,8 @@ def open_draft_for_update(db_path, version):
     conn = sqlite3.connect(db_path)
     # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
     # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
-    # drafts/changes、不插入草稿，也不改动原有表结构与数据。此查询只
-    # 读 sqlite_master，不会开启写事务或产生 journal。
+    # drafts/changes、不插入草稿或变更，也不改动原有表结构与数据。此
+    # 查询只读 sqlite_master，不会开启写事务或产生 journal。
     has_table = conn.execute(
         "SELECT 1 FROM sqlite_master"
         " WHERE type = 'table' AND name = 'drafts'"
@@ -365,8 +309,8 @@ def open_draft_for_update(db_path, version):
         conn.close()
         return None, fail(f"Version not found: {version}")
 
-    # 先确认草稿存在，再定位条目，避免给不存在的版本补建条目或误报、
-    # 改动其他版本的数据。
+    # 先确认草稿存在，再交由调用方定位条目或计算追加位置，避免给不
+    # 存在的版本补建条目或误报、改动其他版本的数据。
     exists = conn.execute(
         "SELECT 1 FROM drafts WHERE version = ?", (version,)
     ).fetchone()
@@ -374,6 +318,52 @@ def open_draft_for_update(db_path, version):
         conn.close()
         return None, fail(f"Version not found: {version}")
     return conn, None
+
+
+def cmd_add_change(args):
+    # 仅允许一条 --change：未提供（None）或重复提供（多于一条）都视为无效草稿。
+    # 名称、追加文本非空白。校验发生在访问数据库之前，即使版本不存在也优先
+    # 报 Invalid draft，失败时不会新建数据库文件。
+    changes = args.change or []
+    if (
+        is_blank(args.version)
+        or len(changes) != 1
+        or is_blank(changes[0])
+    ):
+        return fail("Invalid draft")
+    change = changes[0]
+
+    # 文件存在性、drafts 表存在性与版本存在性检查复用 add-change /
+    # set-change / remove-change / move-change 共用的草稿访问流程：
+    # 不创建数据库、不补建表、不改动原有表与数据，失败信息已写入 stderr。
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
+    try:
+        with conn:
+            # 新条目排在全部现存条目之后：position 取该版本现存记录的
+            # MAX(position) + 1（无现存记录时为 0）。删除中间或末尾条目
+            # 会留下 position 空洞，但 MAX 只随现存记录变化，追加结果仍
+            # 是末尾；展示顺序一律由读取处的 ORDER BY position 决定。
+            row = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM changes"
+                " WHERE version = ?",
+                (args.version,),
+            ).fetchone()
+            next_position = row[0] + 1
+            # 只插入一条独立记录：内容按原文保存，不去重、不裁剪空白、
+            # 不转义，相同文本再次提交仍产生独立的新记录；标题、旧条目
+            # 的原文与相对顺序、其他版本均不受影响。
+            conn.execute(
+                "INSERT INTO changes(version, position, content)"
+                " VALUES (?, ?, ?)",
+                (args.version, next_position, change),
+            )
+    finally:
+        conn.close()
+
+    print(f"Added change: {args.version}")
+    return 0
 
 
 def locate_change(conn, version, index_text):
