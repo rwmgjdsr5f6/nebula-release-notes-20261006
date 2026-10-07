@@ -342,9 +342,10 @@ def validate_change_index(indexes):
 
 
 def open_draft_for_update(db_path, version):
-    """为 set-change / remove-change 打开已有数据库并确认版本存在。
+    """为 remove-change / move-change 打开已有数据库并确认版本存在。
 
-    不创建数据库：文件不存在即视为版本不存在。成功时返回
+    不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
+    （完全空库或只有无关表）即视为版本不存在。成功时返回
     (连接, None)，调用方负责关闭连接；失败时返回 (None, 退出码)，
     错误信息已写入标准错误。
     """
@@ -352,6 +353,18 @@ def open_draft_for_update(db_path, version):
         return None, fail(f"Version not found: {version}")
 
     conn = sqlite3.connect(db_path)
+    # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
+    # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
+    # drafts/changes、不插入草稿，也不改动原有表结构与数据。此查询只
+    # 读 sqlite_master，不会开启写事务或产生 journal。
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master"
+        " WHERE type = 'table' AND name = 'drafts'"
+    ).fetchone()
+    if has_table is None:
+        conn.close()
+        return None, fail(f"Version not found: {version}")
+
     # 先确认草稿存在，再定位条目，避免给不存在的版本补建条目或误报、
     # 改动其他版本的数据。
     exists = conn.execute(
