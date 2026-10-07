@@ -1,0 +1,520 @@
+"""release_notes.py set-change 替换入口缺表边界的离线回归测试。
+
+背景：set-title / add-change 已能把缺少 drafts 表的数据库按版本不存在
+处理，但 set-change 在同类数据库（完全没有任何表，或只有 unrelated
+一类无关表）上会直接执行 SELECT FROM drafts 而抛出
+"no such table: drafts"，向标准错误暴露异常堆栈。修复后 set-change
+也应统一按版本不存在处理。
+
+覆盖范围（仅通过命令行与外部可观察行为验收）：
+  - 在两类预先准备好的数据库上调用
+    set-change demo-0.1 --index 01 --change "修订"：退出码 1、标准输出
+    为空、标准错误恰为 "Version not found: demo-0.1\\n"，不含异常堆栈；
+  - 失败完全不写入：调用前后数据库文件逐字节一致，表结构
+    （sqlite_master 全部行）与原有数据完全一致，不补建 drafts /
+    changes、不插入草稿，临时目录不出现 journal、wal 等附属文件；
+  - 路径不存在时仍返回同一版本不存在结果，且不创建任何文件；
+  - 输入校验优先于数据库检查：未提供或重复提供 --index、--change，
+    版本名或新文本为空、仅含空白，序号不是由 ASCII 数字组成的正整数
+    时，即使数据库缺表也统一报 "Invalid draft"，且不改动数据库；
+  - drafts 表存在但查无版本（含仅大小写不同）时，保留既有版本不存在
+    结果，消息中的版本名保留传入原文；
+  - 版本存在但序号越界时，返回 "Change not found: <版本名> #<序号>"，
+    序号去掉前导零，失败后导出与原始 Markdown 完全一致；
+  - 正常路径：固定样例 demo-0.1（标题 "预览说明"，三条变更依次为两条
+    重复的 "新增预览" 与一条多行文本）以序号 02 替换第二条后退出 0、
+    标准错误为空、标准输出为 "Updated change: demo-0.1 #2\\n"；只改
+    指定条目的原文，标题、数量、顺序、重复条目与其他版本不受影响，
+    多行文本与首尾空格原样保存；相同文本再次提交仍成功；新进程 show
+    与 export-markdown 均反映当前保存内容。
+
+运行方式（项目根目录）：
+    python -m unittest discover -s tests
+
+只依赖 Python 3 标准库；每个测试使用独立的临时目录与 SQLite 路径，
+不读取或改写用户数据库，不联网，重复执行结果一致。
+"""
+
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(PROJECT_ROOT, "release_notes.py")
+
+# 正常路径固定样例：版本 demo-0.1，标题与变更均为虚构软件样例；
+# 三条变更依次为两条重复文本与一条多行文本。
+VERSION = "demo-0.1"
+TITLE = "预览说明"
+CHANGES = ["新增预览", "新增预览", "第一行\n第二行"]
+
+OTHER_VERSION = "demo-0.2"
+OTHER_TITLE = "另一版本说明"
+OTHER_CHANGES = ["其他变更"]
+
+# 缺表边界固定小样例：set-change demo-0.1 --index 01 --change "修订"。
+BOUNDARY_INDEX = "01"
+BOUNDARY_CHANGE = "修订"
+
+# 替换用新文本：首尾各一个空格，两行之间恰好一个换行。
+NEW_CHANGE = " 修订，#预览\n保留标点。 "
+
+# 替换第二条后的期望 show 输出（按 README 固定格式独立写明）：标题不变，
+# 仅第二条变为新内容，重复的第一条与第三条多行文本及顺序原样保留。
+EXPECTED_SHOW_AFTER_REPLACE = (
+    "Version: demo-0.1\n"
+    "Title: 预览说明\n"
+    "- 新增预览\n"
+    "-  修订，#预览\n"
+    "保留标点。 \n"
+    "- 第一行\n"
+    "第二行\n"
+)
+
+# 替换第二条后的期望导出文本（按 README 固定格式独立写明）。
+EXPECTED_EXPORT_AFTER_REPLACE = (
+    "# demo-0.1\n"
+    "\n"
+    "预览说明\n"
+    "\n"
+    "- 新增预览\n"
+    "-  修订，#预览\n"
+    "保留标点。 \n"
+    "- 第一行\n"
+    "第二行\n"
+)
+
+# unrelated 表中的示例数据，替换失败后必须原样保留。
+UNRELATED_ROWS = [(1, "示例数据")]
+
+# 空字符串与仅含空白（空格、制表符、换行）的版本名与新文本。
+BLANK_NAMES = ["", "   ", " \n\t "]
+BLANK_CHANGES = ["", "   ", " \n\t "]
+
+# 非法序号：不是由 ASCII 数字组成的正整数（含 0、前导零后的 0、负号、
+# 小数、字母、全角数字、空白、空串）。
+INVALID_INDEXES = ["0", "00", "-1", "1.0", "1a", "１２", " 1", "1 ", ""]
+
+
+def run_cli(db_path, *args):
+    """在独立子进程中执行 release_notes.py，返回 (退出码, stdout, stderr)。
+
+    输出按字节捕获后以 UTF-8 解码，保证中文、标点与空格精确可比。
+    """
+    result = subprocess.run(
+        [sys.executable, SCRIPT, "--db", db_path, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return (
+        result.returncode,
+        result.stdout.decode("utf-8"),
+        result.stderr.decode("utf-8"),
+    )
+
+
+def create(db_path, version, title, changes):
+    args = ["create", version, "--title", title]
+    for change in changes:
+        args += ["--change", change]
+    return run_cli(db_path, *args)
+
+
+def set_change(db_path, version, index, change):
+    return run_cli(
+        db_path, "set-change", version, "--index", str(index),
+        "--change", change,
+    )
+
+
+def snapshot_database(db_path):
+    """读取数据库的全部表结构（sqlite_master 行）与各表内容快照。
+
+    返回 (sqlite_master 行列表, {表名: 行列表})，按固定顺序排列，
+    用于核对替换失败前后库结构与数据完全一致。
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        master = conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master"
+            " ORDER BY type, name"
+        ).fetchall()
+        tables = {}
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " ORDER BY name"
+        ):
+            # sqlite 内部序列表（sqlite_sequence 等）也按内容一并核对。
+            tables[name] = conn.execute(
+                f'SELECT * FROM "{name}"'
+            ).fetchall()
+    finally:
+        conn.close()
+    return master, tables
+
+
+class DatabaseFixture:
+    """共享的临时目录、建库与核对工具；不定义测试方法，不被 unittest 收集。"""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="release-notes-set-")
+        self.addCleanup(self._tmpdir.cleanup)
+        self.db = os.path.join(self._tmpdir.name, "notes.sqlite")
+
+    def read_database_bytes(self):
+        with open(self.db, "rb") as handle:
+            return handle.read()
+
+    def build_empty_sqlite_database(self):
+        """建立不含任何表的合法 SQLite 数据库（具备文件头）。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute("CREATE TABLE _init (x INTEGER)")
+            conn.execute("DROP TABLE _init")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def build_unrelated_table_database(self):
+        """建立只有 unrelated 表且保存一行示例数据的数据库。"""
+        conn = sqlite3.connect(self.db)
+        try:
+            conn.execute(
+                "CREATE TABLE unrelated (id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO unrelated(id, note) VALUES (?, ?)",
+                UNRELATED_ROWS,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def assert_version_not_found(self, result, version=VERSION):
+        """核对缺表替换边界：退出 1、空 stdout、固定单行 stderr、无堆栈。"""
+        code, out, err = result
+        self.assertEqual(code, 1, "缺少 drafts 表时退出码应为 1")
+        self.assertEqual(out, "", "失败时标准输出应为空")
+        self.assertEqual(
+            err,
+            f"Version not found: {version}\n",
+            "标准错误应恰为 Version not found 加一个换行，版本名保留原文",
+        )
+        self.assertNotIn("Traceback", err, "标准错误不得包含异常堆栈")
+        self.assertNotIn("sqlite3", err, "标准错误不得暴露底层异常")
+        self.assertNotIn("OperationalError", err, "标准错误不得暴露底层异常")
+
+    def assert_invalid_draft(self, result):
+        """核对输入校验：退出 1、空 stdout、stderr 恰为 Invalid draft。"""
+        code, out, err = result
+        self.assertEqual(code, 1, "无效输入退出码应为 1")
+        self.assertEqual(out, "", "失败时标准输出应为空")
+        self.assertEqual(
+            err, "Invalid draft\n", "标准错误应恰为 Invalid draft 加一个换行"
+        )
+
+    def assert_database_unchanged(self, bytes_before, snapshot_before):
+        """文件字节、表结构、各表数据与目录文件集合均保持不变。"""
+        self.assertEqual(
+            self.read_database_bytes(),
+            bytes_before,
+            "失败替换前后数据库文件必须逐字节一致",
+        )
+        snapshot_after = snapshot_database(self.db)
+        self.assertEqual(
+            snapshot_after,
+            snapshot_before,
+            "失败替换前后表结构与原有数据必须完全一致",
+        )
+        master_after = snapshot_after[0]
+        table_names = {row[1] for row in master_after if row[0] == "table"}
+        self.assertNotIn("drafts", table_names, "不得补建 drafts 表")
+        self.assertNotIn("changes", table_names, "不得补建 changes 表")
+        # 目录内只有数据库文件本身，不出现 journal、wal 等附属文件。
+        self.assertEqual(
+            sorted(os.listdir(self._tmpdir.name)),
+            [os.path.basename(self.db)],
+            "失败替换不得产生任何附属文件",
+        )
+
+    def run_missing_table_boundary(self, build_database, case_label):
+        """两类数据库共用的缺表替换边界核对流程。"""
+        build_database()
+        bytes_before = self.read_database_bytes()
+        snapshot_before = snapshot_database(self.db)
+
+        # 固定小样例：set-change demo-0.1 --index 01 --change "修订"。
+        with self.subTest(case=case_label):
+            self.assert_version_not_found(
+                set_change(self.db, VERSION, BOUNDARY_INDEX, BOUNDARY_CHANGE)
+            )
+            self.assert_database_unchanged(bytes_before, snapshot_before)
+
+
+class TestSetChangeMissingDraftsTable(DatabaseFixture, unittest.TestCase):
+    """已存在但没有 drafts 表的数据库：set-change 的替换边界。"""
+
+    def test_empty_sqlite_database_without_any_table(self):
+        # 完全没有表的合法数据库也必须得到确定的业务结果。
+        self.run_missing_table_boundary(
+            self.build_empty_sqlite_database, "empty"
+        )
+        master, tables = snapshot_database(self.db)
+        self.assertEqual(master, [], "空库替换失败后仍不应有任何表")
+        self.assertEqual(tables, {}, "空库替换失败后仍不应有任何表数据")
+
+    def test_database_with_only_unrelated_table_and_sample_row(self):
+        self.run_missing_table_boundary(
+            self.build_unrelated_table_database, "unrelated"
+        )
+        # 额外核对 unrelated 的建表语句与示例行原样保留。
+        master, tables = snapshot_database(self.db)
+        self.assertEqual(
+            [row[1] for row in master], ["unrelated"], "只剩 unrelated 表"
+        )
+        self.assertEqual(
+            tables["unrelated"],
+            UNRELATED_ROWS,
+            "unrelated 表的示例数据必须原样保留",
+        )
+
+    def test_missing_path_still_not_found_without_creating_file(self):
+        db_path = os.path.join(self._tmpdir.name, "missing.sqlite")
+        self.assertEqual(os.listdir(self._tmpdir.name), [])
+
+        code, out, err = set_change(
+            db_path, VERSION, BOUNDARY_INDEX, BOUNDARY_CHANGE
+        )
+        self.assert_version_not_found((code, out, err))
+        self.assertFalse(
+            os.path.exists(db_path), "版本不存在时不得创建数据库文件"
+        )
+        self.assertEqual(
+            os.listdir(self._tmpdir.name), [], "失败后目录内应无任何文件"
+        )
+
+
+class TestValidationPriorityOnMissingTables(DatabaseFixture, unittest.TestCase):
+    """缺表库上的输入校验优先级：先校验，后查库。"""
+
+    def test_invalid_input_reports_invalid_draft_before_database_check(self):
+        for build_database, case_label in (
+            (self.build_empty_sqlite_database, "empty"),
+            (self.build_unrelated_table_database, "unrelated"),
+        ):
+            with self.subTest(case=case_label):
+                build_database()
+                bytes_before = self.read_database_bytes()
+                snapshot_before = snapshot_database(self.db)
+
+                # 未提供 --index 或 --change。
+                self.assert_invalid_draft(
+                    run_cli(
+                        self.db, "set-change", VERSION,
+                        "--change", BOUNDARY_CHANGE,
+                    )
+                )
+                self.assert_invalid_draft(
+                    run_cli(self.db, "set-change", VERSION, "--index", "1")
+                )
+                # 重复提供 --index 或 --change。
+                self.assert_invalid_draft(
+                    run_cli(
+                        self.db, "set-change", VERSION,
+                        "--index", "1", "--index", "2",
+                        "--change", BOUNDARY_CHANGE,
+                    )
+                )
+                self.assert_invalid_draft(
+                    run_cli(
+                        self.db, "set-change", VERSION, "--index", "1",
+                        "--change", "a", "--change", "b",
+                    )
+                )
+                # 版本名为空或仅含空白。
+                for name in BLANK_NAMES:
+                    self.assert_invalid_draft(
+                        set_change(self.db, name, "1", BOUNDARY_CHANGE)
+                    )
+                # 新文本为空或仅含空白。
+                for text in BLANK_CHANGES:
+                    self.assert_invalid_draft(
+                        set_change(self.db, VERSION, "1", text)
+                    )
+                # 序号不是由 ASCII 数字组成的正整数。
+                for index in INVALID_INDEXES:
+                    self.assert_invalid_draft(
+                        set_change(self.db, VERSION, index, BOUNDARY_CHANGE)
+                    )
+
+                self.assert_database_unchanged(bytes_before, snapshot_before)
+
+
+class TestExistingDraftsTableRulesKept(DatabaseFixture, unittest.TestCase):
+    """drafts 表存在时既有行为保持不变。"""
+
+    def test_version_missing_when_drafts_table_exists(self):
+        # 草稿表存在但查无版本：保留既有版本不存在结果。
+        code, out, err = create(self.db, VERSION, TITLE, CHANGES)
+        self.assertEqual((code, out, err), (0, f"Created {VERSION}\n", ""))
+
+        bytes_before = self.read_database_bytes()
+        self.assert_version_not_found(
+            set_change(self.db, "demo-0.9", "1", BOUNDARY_CHANGE),
+            version="demo-0.9",
+        )
+        # 失败替换同样不改动任何已有数据。
+        self.assertEqual(
+            self.read_database_bytes(),
+            bytes_before,
+            "版本不存在时不得改动数据库",
+        )
+
+    def test_case_sensitive_exact_match_does_not_write_on_mismatch(self):
+        code, _, _ = create(self.db, VERSION, TITLE, CHANGES)
+        self.assertEqual(code, 0)
+
+        # 大小写不同的版本名视为不存在，消息保留实际传入的原文。
+        self.assert_version_not_found(
+            set_change(self.db, VERSION.upper(), "1", "不应写入"),
+            version=VERSION.upper(),
+        )
+
+        conn = sqlite3.connect(self.db)
+        try:
+            rows = conn.execute(
+                "SELECT position, content FROM changes"
+                " WHERE version = ? ORDER BY position",
+                (VERSION,),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(
+            rows,
+            list(enumerate(CHANGES)),
+            "大小写不匹配时不得改动任何变更",
+        )
+
+    def test_out_of_range_index_reports_change_not_found(self):
+        code, _, _ = create(self.db, VERSION, TITLE, CHANGES)
+        self.assertEqual(code, 0)
+
+        bytes_before = self.read_database_bytes()
+        # 序号 04 超出三条变更的范围：前导零不影响定位，错误消息不保留前导零。
+        code, out, err = set_change(self.db, VERSION, "04", "不应写入")
+        self.assertEqual(code, 1, "序号越界时退出码应为 1")
+        self.assertEqual(out, "", "失败时标准输出应为空")
+        self.assertEqual(
+            err,
+            "Change not found: demo-0.1 #4\n",
+            "标准错误应恰为 Change not found: demo-0.1 #4 加末尾换行",
+        )
+        self.assertEqual(
+            self.read_database_bytes(),
+            bytes_before,
+            "序号越界的失败替换不得改动数据库",
+        )
+
+
+class TestSetChangeNormalPath(DatabaseFixture, unittest.TestCase):
+    """正常替换：只改指定条目，其余内容、其他版本与幂等性均保持。"""
+
+    def test_replace_output_persistence_and_isolation(self):
+        code, out, err = create(self.db, VERSION, TITLE, CHANGES)
+        self.assertEqual((code, out, err), (0, f"Created {VERSION}\n", ""))
+        code, out, err = create(
+            self.db, OTHER_VERSION, OTHER_TITLE, OTHER_CHANGES
+        )
+        self.assertEqual(
+            (code, out, err), (0, f"Created {OTHER_VERSION}\n", "")
+        )
+
+        # 成功替换：退出 0，stderr 为空，stdout 恰为固定成功消息，
+        # 带前导零的序号 02 在消息中不保留前导零。
+        code, out, err = set_change(self.db, VERSION, "02", NEW_CHANGE)
+        self.assertEqual(code, 0, "set-change 成功退出码应为 0")
+        self.assertEqual(
+            out,
+            f"Updated change: {VERSION} #2\n",
+            "成功时标准输出应为 Updated change 加版本名、去零序号与一个换行",
+        )
+        self.assertEqual(err, "", "成功时标准错误应为空")
+
+        # 新进程查看：标题不变，仅第二条变为新内容，重复的第一条与第三条
+        # 多行文本及顺序原样保留，新文本的首尾空格与内部换行原样保存。
+        code, out, err = run_cli(self.db, "show", VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            EXPECTED_SHOW_AFTER_REPLACE,
+            "替换后标题不变，仅第二条被替换，其余条目与顺序原样保留",
+        )
+
+        # 新进程导出：与 show 一致反映当前保存内容。
+        code, out, err = run_cli(self.db, "export-markdown", VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            EXPECTED_EXPORT_AFTER_REPLACE,
+            "导出文本应精确匹配固定格式，仅第二条出现新内容",
+        )
+
+        # 直接核对库内数据：条目数量不变，仅第二条原文被替换，position
+        # 不重排；其他版本不受影响。
+        conn = sqlite3.connect(self.db)
+        try:
+            title_row = conn.execute(
+                "SELECT title FROM drafts WHERE version = ?", (VERSION,)
+            ).fetchone()
+            change_rows = conn.execute(
+                "SELECT position, content FROM changes"
+                " WHERE version = ? ORDER BY position",
+                (VERSION,),
+            ).fetchall()
+            other_change_rows = conn.execute(
+                "SELECT position, content FROM changes"
+                " WHERE version = ? ORDER BY position",
+                (OTHER_VERSION,),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(title_row, (TITLE,), "标题不随替换改变")
+        self.assertEqual(
+            change_rows,
+            [(0, "新增预览"), (1, NEW_CHANGE), (2, "第一行\n第二行")],
+            "仅第二条原文被替换，数量、位置与重复条目均不变",
+        )
+        self.assertEqual(
+            other_change_rows,
+            list(enumerate(OTHER_CHANGES)),
+            "其他版本的变更不受影响",
+        )
+
+        # 相同文本再次提交仍成功，成功消息与保存内容不变。
+        code, out, err = set_change(self.db, VERSION, "2", NEW_CHANGE)
+        self.assertEqual(
+            (code, out, err),
+            (0, f"Updated change: {VERSION} #2\n", ""),
+            "相同文本再次提交仍应成功",
+        )
+        code, out, err = run_cli(self.db, "show", VERSION)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out,
+            EXPECTED_SHOW_AFTER_REPLACE,
+            "重复提交相同文本后保存内容不变",
+        )
+
+        # 替换完成后目录内只有数据库文件，不残留 journal、wal 等。
+        self.assertEqual(
+            sorted(os.listdir(self._tmpdir.name)),
+            [os.path.basename(self.db)],
+            "替换完成后目录内应只有数据库文件",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
