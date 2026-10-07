@@ -145,6 +145,18 @@ def cmd_show(args):
 
 
 def cmd_list_drafts(args):
+    # --prefix 仅允许一次且值为非空白文本：省略（None）时保留全部目录
+    # 行为；显式提供但缺值（nargs='?' 落空时取空串常量）、值为空或仅含
+    # 空白、重复提供都视为无效草稿。校验先于任何数据库访问，即使数据库
+    # 文件不存在也优先报 Invalid draft，且不创建数据库或补建表。
+    prefixes = args.prefix
+    if prefixes is not None:
+        if len(prefixes) != 1 or is_blank(prefixes[0]):
+            return fail("Invalid draft")
+        prefix = prefixes[0]
+    else:
+        prefix = None
+
     # 只读目录查询：数据库文件不存在时直接输出空数组，不连接、不建库。
     items = []
     if os.path.exists(args.db):
@@ -160,6 +172,14 @@ def cmd_list_drafts(args):
                 rows = conn.execute(
                     "SELECT version, title FROM drafts"
                 ).fetchall()
+                if prefix is not None:
+                    # 前缀筛选在 Python 侧按版本名原文逐字符进行：区分
+                    # 大小写、不裁剪空白、不解析语义版本，中文与内部换行
+                    # 按原文比较；% 与 _ 是普通字符（不经 SQL LIKE 通配），
+                    # 标题与变更内容不参与匹配。
+                    rows = [
+                        row for row in rows if row[0].startswith(prefix)
+                    ]
                 # 排序在 Python 侧按版本名原文逐字符比较：即 Unicode
                 # 码点升序，前缀相同时较短名称在前，不做语义版本解析，
                 # 也不合并大小写不同的名称。
@@ -497,6 +517,19 @@ def build_parser():
 
     parser_list_drafts = subparsers.add_parser(
         "list-drafts", help="列出全部已保存草稿的版本名与标题"
+    )
+    # action="append" 使重复提供可被计数（多于一条即无效）；nargs='?' 配合
+    # const="" 让显式给出却缺值的 --prefix 以空串进入处理函数而非触发
+    # argparse 自带报错，从而统一报 Invalid draft（退出码 1）。值不设
+    # default，省略时为 None，表示不筛选、保留全部目录行为。
+    parser_list_drafts.add_argument(
+        "--prefix",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="TEXT",
+        help="可选版本名前缀：仅返回版本名原文以该文本开头的草稿，区分"
+        "大小写、不裁剪空白，%% 与 _ 为普通字符；省略则列出全部草稿",
     )
     parser_list_drafts.set_defaults(func=cmd_list_drafts)
 
