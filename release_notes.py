@@ -235,32 +235,22 @@ def cmd_set_title(args):
     if is_blank(args.version) or args.title is None or is_blank(args.title):
         return fail("Invalid draft")
 
-    # set-title 不创建数据库：文件不存在即视为版本不存在。
-    if not os.path.exists(args.db):
-        return fail(f"Version not found: {args.version}")
-
-    conn = sqlite3.connect(args.db)
+    # 文件存在性、drafts 表存在性与版本存在性检查复用 add-change /
+    # set-change / remove-change / move-change 共用的草稿访问流程：
+    # 不创建数据库、不补建表、不改动原有表与数据，失败信息已写入 stderr。
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
     try:
-        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-        # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
-        # drafts/changes、不插入草稿，也不改动原有表结构与数据。此查询只
-        # 读 sqlite_master，不会开启写事务或产生 journal。
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master"
-            " WHERE type = 'table' AND name = 'drafts'"
-        ).fetchone()
-        if has_table is None:
-            return fail(f"Version not found: {args.version}")
-
-        # 单条 UPDATE 天然幂等：标题相同则匹配但不改变任何内容，
-        # 不会新增草稿或变更条目；版本不存在时 rowcount 为 0。
+        # 单条 UPDATE 天然幂等：标题相同则匹配但不改变任何内容，不会新增
+        # 草稿或变更条目。版本存在已由共享流程预先确认，故无需再按
+        # rowcount 判定版本不存在；该流程只访问 drafts 表、不触碰 changes，
+        # 库中没有 changes 表时修订同样成功，且不会补建 changes 表。
         with conn:
-            cursor = conn.execute(
+            conn.execute(
                 "UPDATE drafts SET title = ? WHERE version = ?",
                 (args.title, args.version),
             )
-            if cursor.rowcount == 0:
-                return fail(f"Version not found: {args.version}")
     finally:
         conn.close()
 
@@ -286,7 +276,8 @@ def validate_change_index(indexes):
 
 
 def open_draft_for_update(db_path, version):
-    """为 add-change / set-change / remove-change / move-change 打开已有数据库并确认版本存在。
+    """为 set-title / add-change / set-change / remove-change / move-change
+    打开已有数据库并确认版本存在。
 
     不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
     （完全空库或只有无关表）即视为版本不存在。成功时返回
