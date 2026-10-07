@@ -1,0 +1,331 @@
+================================================================================
+list-drafts 草稿目录查询与 --prefix 前缀筛选 —— 源码核对说明（纯文本）
+================================================================================
+
+核对日期：2026-10-07
+核对目录：/mnt/c/NebulaForge/projects/forge13/solverB/task025
+核对方法：以阅读公开说明与源码、按代码路径静态推演为主；文中所有“预期
+          结果”均先按源码静态推演得出并如此标注。为排除推演笔误，关键
+          样例另在项目之外的临时目录用一次性命令实际核对过（临时文件
+          已删除，项目内文件与数据库不受影响）；文中结论以源码为准。
+材料读取情况：全部可读，无“证据不可读取，无法确认”项。
+  - README.md（公开说明，420 行）
+  - release_notes.py（唯一源码，725 行）
+  - tests/test_list_drafts_prefix.py（前缀筛选的离线回归测试，仅作
+    旁证，本文结论不依赖它）
+
+行号引用格式：README.md:行号、release_notes.py:行号（行号对应当前版本）。
+范围限定：仅 list-drafts 的目录输出与 --prefix 前缀筛选；不涉及创建、
+查看、修订、删除、移动、重命名与 Markdown 导出等其他命令的内部流程。
+本文只整理既有行为，不改动任何命令、数据格式或文本语义。
+
+
+--------------------------------------------------------------------------------
+一、从公开入口到实现的追踪
+--------------------------------------------------------------------------------
+
+1. 公开入口（README 约定）
+   - 入口与数据库：README.md:12-16，命令行入口为 release_notes.py，所有
+     操作通过 --db 指定同一个 SQLite 数据库文件。
+   - 目录查询用法：README.md:55-59
+       python release_notes.py --db notes.sqlite list-drafts
+   - 前缀筛选用法：README.md:76-80
+       python release_notes.py --db notes.sqlite list-drafts --prefix v1
+   - 输出约定：README.md:61-67，成功时退出码 0、标准错误为空，标准输出
+     是一个 UTF-8 JSON 数组，末尾恰有一个换行；每个元素只含 version 与
+     title 两个字符串字段，不含变更条目；非 ASCII 字符直接输出，引号、
+     反斜杠与控制字符按 JSON 规则转义，解析后与数据库原文完全一致。
+   - 排序约定：README.md:68-69，按版本名原文的 Unicode 码点逐字符升序，
+     前缀相同时较短名称在前；不按语义版本号、创建顺序或标题排序，也不
+     合并大小写不同的名称。
+   - 空结果约定：README.md:70-71，数据库文件不存在或库中没有草稿时同样
+     退出 0、标准错误为空，只输出 [] 和末尾换行，且不创建数据库文件。
+   - 只读约定：README.md:72-74，查询不改变任何草稿与变更，数据未变化时
+     另一个进程用同一路径查询得到相同数组。
+   - 筛选语义：README.md:82-89，仅按版本名原文开头匹配，标题与变更内容
+     不参与；区分大小写、不解析语义版本、前缀不裁剪，% 和 _ 是普通字符；
+     没有匹配项、路径不存在、库中没有草稿表或表中没有草稿时都只输出
+     [] 加末尾换行，不创建数据库或补建表。
+   - 失败约定：README.md:90-92，显式提供 --prefix 却没有值、值为空或仅
+     含空白、重复提供该选项时，退出码 1、标准输出为空，标准错误仅输出
+     Invalid draft 和一个换行；即使数据库文件不存在也优先返回此错误。
+
+2. 程序实际入口与参数定义（源码）
+   - 进程入口：release_notes.py:723-724
+       if __name__ == "__main__": sys.exit(main())
+     main 的返回值即进程退出码（0 或 1）。
+   - 输出编码：release_notes.py:716-717，main 先把 stdout/stderr
+     reconfigure 为 UTF-8，中文、标点与首尾空格按 UTF-8 原样输出，不
+     依赖运行环境区域设置。
+   - --db：release_notes.py:564，required=True。
+   - 子命令注册：release_notes.py:565；list-drafts 的子解析器在
+     release_notes.py:582-584 注册。
+   - --prefix 定义：release_notes.py:589-597。要点（注释见
+     release_notes.py:585-588）：
+       action="append"：每次出现追加一个值，重复提供可被计数；
+       nargs="?" 配合 const=""：显式给出却缺值的 --prefix 以空串进入
+         处理函数，而非触发 argparse 自带报错，从而统一报 Invalid draft；
+       不设 default：省略该选项时 args.prefix 为 None，表示不筛选。
+   - 分发：release_notes.py:598 把处理函数设为 cmd_list_drafts；
+     release_notes.py:719-720 parse_args 后调用 args.func(args)，即
+     cmd_list_drafts（release_notes.py:148-198）。
+
+3. 涉及的数据库结构（源码）
+   release_notes.py:27-39 的 SCHEMA 定义了 drafts(version, title) 与
+   changes(id, version, position, content) 两表。注意：SCHEMA 只在
+   cmd_create（release_notes.py:70）中执行；cmd_list_drafts 全程不执行
+   任何建表语句（详见第三节）。
+
+
+--------------------------------------------------------------------------------
+二、cmd_list_drafts 的代码路径（参数校验 → 存在性检查 → 筛选排序 → 输出）
+--------------------------------------------------------------------------------
+
+以下按执行顺序列出每个分支，均可沿行号核对。
+
+第 1 步：参数校验（先于任何数据库访问）
+  release_notes.py:153-159：
+    prefixes = args.prefix
+    if prefixes is not None:
+        if len(prefixes) != 1 or is_blank(prefixes[0]):
+            return fail("Invalid draft")
+        prefix = prefixes[0]
+    else:
+        prefix = None
+  - 省略 --prefix：prefixes 为 None（release_notes.py:154），prefix 置
+    None，表示不筛选、保留全部目录行为（release_notes.py:158-159）。
+  - 重复提供：len(prefixes) != 1（release_notes.py:155），无效。
+  - 显式缺值：nargs='?' 落空取 const=""（release_notes.py:592-593），
+    空串经 is_blank 判为空白（release_notes.py:42-44：空字符串或仅由
+    空白字符组成，含换行），无效。
+  - 值为空或仅含空白：同样由 is_blank 判为无效。
+  - 失败出口：fail（release_notes.py:47-50）向标准错误打印消息并返回 1；
+    此处消息恰为 "Invalid draft"，print 自带一个换行，标准输出无内容。
+  - 优先级：校验在 release_notes.py:163 的文件存在性检查之前，因此即使
+    数据库文件不存在也优先报 Invalid draft，且全程未调用
+    sqlite3.connect，不会创建数据库文件（注释见
+    release_notes.py:149-152）。对应 README.md:90-92。
+
+第 2 步：数据库文件存在性检查（不建库）
+  release_notes.py:162-163：
+    items = []
+    if os.path.exists(args.db):
+  - 文件不存在：不连接、不建库，items 保持空列表，直接落到第 5 步输出
+    []（注释见 release_notes.py:161）。对应 README.md:70-71。
+
+第 3 步：草稿表存在性检查（不补建表）
+  release_notes.py:164-172：
+    conn = sqlite3.connect(args.db)
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master"
+        " WHERE type = 'table' AND name = 'drafts'"
+    ).fetchone()
+  - 文件存在但没有 drafts 表：has_table 为 None，跳过后续查询，与空库
+    等价，仍输出 []；不执行任何建表语句（注释见
+    release_notes.py:166-167）。对应 README.md:88-89。
+  - 连接只用于 SELECT；release_notes.py:192-193 的 finally 保证关闭。
+
+第 4 步：读取、筛选、排序（全部在 Python 侧按原文进行）
+  - 读取：release_notes.py:173-175，
+      SELECT version, title FROM drafts
+    只取版本名与标题两列，不读取变更条目（对应 README.md:63-64 的
+    “不包含变更条目”）。
+  - 筛选：release_notes.py:176-183，仅当 prefix 非 None 时执行
+      rows = [row for row in rows if row[0].startswith(prefix)]
+    要点（注释见 release_notes.py:177-180）：
+      只比较 row[0] 即版本名原文，标题与变更内容不参与匹配；
+      str.startswith 逐字符比较：区分大小写、不裁剪空白、不解析语义
+      版本，中文与内部换行按原文比较；
+      筛选不走 SQL LIKE，% 与 _ 是普通字符，无通配语义。
+    对应 README.md:82-87。
+  - 排序：release_notes.py:184-187，
+      rows.sort(key=lambda row: row[0])
+    Python 字符串比较即 Unicode 码点逐字符升序；前缀相同时较短名称在
+    前；不做语义版本解析，不合并大小写不同的名称，与创建顺序无关。
+    对应 README.md:68-69。
+  - 组装：release_notes.py:188-191，每行变为
+      {"version": version, "title": title}
+    仅此两个字段。
+
+第 5 步：输出
+  release_notes.py:195-198：
+    sys.stdout.write(json.dumps(items, ensure_ascii=False) + "\n")
+    return 0
+  - ensure_ascii=False：中文等非 ASCII 字符直接输出；引号、反斜杠与
+    控制字符仍由 json 按规则转义（注释见 release_notes.py:195-196），
+    因此标准输出经 JSON 解析后与数据库保存的原文完全一致，首尾空格与
+    内部换行均不裁剪。对应 README.md:65-67。
+  - 末尾恰有一个换行，无提示语或其他内容；标准错误全程无输出。
+  - 返回 0，即进程退出码 0。
+
+
+--------------------------------------------------------------------------------
+三、只读性质与跨进程一致性
+--------------------------------------------------------------------------------
+
+- 不补建表：cmd_list_drafts 全程不执行 SCHEMA（对比 cmd_create 在
+  release_notes.py:70 的 executescript）；第 3 步只查询 sqlite_master。
+- 不建库：数据库文件不存在时在第 2 步即短路，从不调用
+  sqlite3.connect（release_notes.py:163-164），missing.sqlite 一类
+  路径不会被创建。
+- 不改数据：函数内只有 SELECT（release_notes.py:168-175），没有任何
+  INSERT/UPDATE/DELETE，草稿与变更的原文、条目数量与展示顺序均不受
+  查询影响；也不创建其他文件。
+- 跨进程一致：以上只读性质意味着数据未变化时，另一个进程使用同一路径
+  查询得到相同数组。对应 README.md:72-74。
+
+
+--------------------------------------------------------------------------------
+四、固定样例（静态推演，预期结果已按第一节方法核对）
+--------------------------------------------------------------------------------
+
+样例数据（本次说明固定使用）：按如下创建顺序依次建四份草稿，每份只有
+一条内容为“示例”的变更：
+
+  python release_notes.py --db notes.sqlite create v10   --title 后续   --change 示例
+  python release_notes.py --db notes.sqlite create other --title v1     --change 示例
+  python release_notes.py --db notes.sqlite create V1    --title 大小写 --change 示例
+  python release_notes.py --db notes.sqlite create v1    --title 预览   --change 示例
+
+即：
+  创建顺序  版本名  标题    变更
+  1         v10     后续    示例
+  2         other   v1      示例
+  3         V1      大小写  示例
+  4         v1      预览    示例
+
+4.1 带前缀查询（本文核心样例）
+
+  python release_notes.py --db notes.sqlite list-drafts --prefix v1
+
+预期结果（按第二节路径静态推演）：
+  退出码：0
+  标准错误：空
+  标准输出：恰为下面一行，后接一个换行，无其他内容：
+  [{"version": "v1", "title": "预览"}, {"version": "v10", "title": "后续"}]
+
+推演过程：
+  - 校验：prefixes == ["v1"]，长度为 1 且非空白，通过
+    （release_notes.py:154-157）。
+  - 读取：四行 (version, title) 全部取出（release_notes.py:173-175）。
+  - 筛选："v1".startswith 判定（release_notes.py:181-183）：
+      v10  → 以 "v1" 开头，保留；
+      v1   → 以 "v1" 开头，保留；
+      other→ 不以 "v1" 开头，排除。注意 other 的标题恰为 "v1"，但标题
+             不参与匹配（release_notes.py:177-180 注释，README.md:83）；
+      V1   → 排除。startswith 区分大小写：'V' 的码点 U+0056 与 'v' 的
+             U+0076 不同，首字符即不等（README.md:85）。
+  - 排序：剩下 "v1" 与 "v10"，按 Unicode 码点逐字符比较，"v1" 是 "v10"
+    的前缀且较短，故 "v1" 在前（release_notes.py:187，README.md:68-69）。
+    结果取决于版本名原文的码点顺序，而非创建顺序（v10 先创建却排在后）
+    或语义版本大小（不做任何版本号解析）。
+  - 输出：json.dumps(..., ensure_ascii=False) 使“预览”“后续”直接以
+    UTF-8 输出，元素间分隔为 ", "，键后冒号带空格，末尾恰一个换行
+    （release_notes.py:197）。该输出经 JSON 解析后，版本名与标题与
+    保存原文完全一致（README.md:65-67）。
+
+4.2 省略前缀（对照）
+
+  python release_notes.py --db notes.sqlite list-drafts
+
+预期结果：退出码 0，标准错误为空，标准输出为全部四份草稿、后接一个
+换行（prefix 为 None，不筛选，release_notes.py:154、158-159、176）：
+  [{"version": "V1", "title": "大小写"}, {"version": "other", "title": "v1"}, {"version": "v1", "title": "预览"}, {"version": "v10", "title": "后续"}]
+排序依据码点：'V'(U+0056) < 'o'(U+006F) < 'v'(U+0076)，与创建顺序
+无关。
+
+4.3 前缀文本的边界性质（沿源码可核对）
+
+  - % 与 _ 是普通字符：筛选用 str.startswith 而非 SQL LIKE
+    （release_notes.py:177-183），--prefix "v%" 只匹配字面以 "v%"
+    开头的版本名，本样例中无匹配，预期输出 [] 加换行。
+  - 首尾空格与内部换行按原文比较：is_blank 只拒绝“整个值皆为空白”
+    （release_notes.py:42-44）；像 " v1" 这样含首尾空格但非全空白的
+    前缀会原样进入 startswith，本样例中无匹配，预期输出 [] 加换行。
+  - 返回文本保真：版本名与标题经 JSON 解析后与保存原文一致，首尾空格
+    与内部换行均不裁剪（release_notes.py:195-197，README.md:65-67）。
+
+
+--------------------------------------------------------------------------------
+五、失败优先级与空结果分支（静态推演，预期结果已核对）
+--------------------------------------------------------------------------------
+
+5.1 失败优先级演示命令
+
+  python release_notes.py --db missing.sqlite list-drafts --prefix
+
+  （--prefix 后不给值；执行前 missing.sqlite 不存在）
+
+预期结果：
+  退出码：1
+  标准输出：空
+  标准错误：恰为下面一行（Invalid draft 加一个换行）：
+  Invalid draft
+  副作用：missing.sqlite 不被创建。
+
+推演过程：--prefix 缺值时 nargs='?' 落空取 const=""，prefixes == [""]
+（release_notes.py:589-597）；is_blank("") 为真（release_notes.py:42-44），
+在 release_notes.py:155-156 直接 return fail("Invalid draft")；fail
+（release_notes.py:47-50）向标准错误打印并返回 1。该校验位于
+release_notes.py:163 的文件存在性检查之前，全程未调用
+sqlite3.connect，故数据库文件不存在也优先报此错，且不创建文件。
+对应 README.md:90-92。
+
+5.2 同样得到上述失败结果的情形（同一代码分支）
+
+  - 空值：        --prefix ""        （is_blank 判空串）
+  - 仅含空白的值：--prefix "   "     （isspace 判定，含换行等空白字符）
+  - 重复提供：    --prefix v1 --prefix v2
+                                     （len(prefixes) != 1，
+                                      release_notes.py:155）
+  三者均退出码 1、标准输出为空、标准错误仅 Invalid draft 加换行；即使
+  数据库文件不存在也优先报此错，且不创建数据库文件。
+
+5.3 成功但输出空数组 [] 的情形（退出码 0，标准错误为空）
+
+  下列情形标准输出均恰为 [] 加一个换行，且都不创建数据库或补建表：
+  - 有效前缀无匹配项：如第四节样例库上 --prefix zz，筛选后 rows 为空
+    （release_notes.py:181-183），items 为空（release_notes.py:188-191）。
+  - 数据库文件不存在：--db missing.sqlite 且前缀有效（如 --prefix v1），
+    第 2 步短路（release_notes.py:163），missing.sqlite 不被创建。
+  - 有效 SQLite 文件但没有 drafts 表：第 3 步 has_table 为 None
+    （release_notes.py:168-172），与空库等价。
+  - drafts 表存在但表内无草稿：SELECT 返回空行集
+    （release_notes.py:173-175），items 为空。
+  对应 README.md:70-71、88-89。
+
+5.4 未约定情形
+
+  数据库文件已损坏（存在但不是有效 SQLite 文件）等情形，README 与源码
+  注释均未约定其行为：sqlite3.connect 或查询可能抛出异常，不能推定为
+  输出空结果 []。本文不对未约定情形作任何断言。
+
+
+--------------------------------------------------------------------------------
+六、核对索引（结论 → 源码 / README 位置）
+--------------------------------------------------------------------------------
+
+  --prefix 参数形态（append / nargs='?' / const="" / 无 default）
+      release_notes.py:585-597
+  校验先于数据库访问，Invalid draft 优先
+      release_notes.py:149-159；README.md:90-92
+  is_blank 空白判定（空串或仅空白，含换行）
+      release_notes.py:42-44
+  fail 输出到标准错误并返回 1
+      release_notes.py:47-50
+  数据库文件不存在 → []，不连接不建库
+      release_notes.py:161-163；README.md:70-71
+  无 drafts 表 → []，不补建表
+      release_notes.py:166-172；README.md:88-89
+  只取 version/title 两列，不含变更
+      release_notes.py:173-175；README.md:63-64
+  前缀筛选：版本名原文 startswith，标题不参与，%/_ 普通字符
+      release_notes.py:176-183；README.md:82-87
+  排序：版本名 Unicode 码点升序，较短前缀在前
+      release_notes.py:184-187；README.md:68-69
+  输出：ensure_ascii=False JSON + 恰一个换行，退出码 0
+      release_notes.py:195-198；README.md:61-67
+  只读、不建库不建表不改数据、跨进程结果一致
+      release_notes.py:148-198 全程；README.md:72-74
+  入口与 UTF-8 输出编码
+      release_notes.py:714-720、723-724；README.md:12-16
