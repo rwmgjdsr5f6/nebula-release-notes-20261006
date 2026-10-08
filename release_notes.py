@@ -98,14 +98,16 @@ def cmd_create(args):
     return 0
 
 
-def open_drafts_readonly(db_path):
-    """show / export-markdown / list-drafts 共用的只读打开流程。
+def open_existing_draft_db(db_path):
+    """打开已有数据库并确认 drafts 表存在，供查询与编辑两类流程共用。
 
-    不创建数据库、不补建表：数据库文件不存在，或文件存在但没有
-    drafts 表（完全空库或只有无关表）时返回 None，调用方按各自的
-    空结果规则处理（show / export-markdown 视为版本不存在，
-    list-drafts 视为空目录）。成功时返回已确认 drafts 表存在的连接，
-    由调用方负责关闭；连接上不执行任何建表或写入语句。
+    这是 show / export-markdown / list-drafts 与 set-title / add-change /
+    set-change / remove-change / move-change / rename-version 共用的唯一
+    前置检查：不创建数据库、不补建表。数据库文件不存在，或文件存在但没有
+    drafts 表（完全空库或只有无关表）时返回 None，由调用方按各自的空结果
+    规则处理（查询入口视为空结果，编辑入口视为版本不存在）。成功时返回已
+    确认 drafts 表存在的连接，由调用方负责关闭；连接上不执行任何建表或
+    写入语句。
     """
     if not os.path.exists(db_path):
         return None
@@ -127,13 +129,13 @@ def open_drafts_readonly(db_path):
 def read_draft(db_path, version):
     """按版本名原文精确读取草稿，供 show 与 export-markdown 共用。
 
-    只读操作，不创建数据库、不补建表：数据库文件不存在、文件存在但
-    没有 drafts 表（完全空库或只有无关表）、或库内没有该版本（含仅
-    大小写不同）时返回 None；否则返回 (标题原文, 变更原文列表)，变更
-    按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行
-    变更仍是一条记录。
+    只读操作，前置检查统一走 open_existing_draft_db：数据库文件不存在、
+    文件存在但没有 drafts 表（完全空库或只有无关表）、或库内没有该版本
+    （含仅大小写不同）时返回 None，不创建数据库、不补建表；否则返回
+    (标题原文, 变更原文列表)，变更按展示顺序（position 升序）读取，不去重、
+    不裁剪、不转义，多行变更仍是一条记录。
     """
-    conn = open_drafts_readonly(db_path)
+    conn = open_existing_draft_db(db_path)
     if conn is None:
         return None
     try:
@@ -184,11 +186,11 @@ def cmd_list_drafts(args):
     else:
         prefix = None
 
-    # 只读目录查询：复用 show / export-markdown 共用的只读打开流程，
-    # 数据库文件不存在或没有 drafts 表时直接输出空数组，不连接、不建库、
-    # 不补建表结构。
+    # 只读目录查询：前置检查统一走查询与编辑共用的
+    # open_existing_draft_db，数据库文件不存在或没有 drafts 表时直接
+    # 输出空数组，不连接、不建库、不补建表结构。
     items = []
-    conn = open_drafts_readonly(args.db)
+    conn = open_existing_draft_db(args.db)
     if conn is not None:
         try:
             rows = conn.execute(
@@ -295,25 +297,14 @@ def open_draft_for_update(db_path, version):
     """为 set-title / add-change / set-change / remove-change / move-change /
     rename-version 打开已有数据库并确认版本存在。
 
-    不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
-    （完全空库或只有无关表）即视为版本不存在。成功时返回
-    (连接, None)，调用方负责关闭连接；失败时返回 (None, 退出码)，
+    文件存在性与 drafts 表存在性检查统一走查询与编辑共用的
+    open_existing_draft_db：不创建数据库、不补建表，文件不存在，或文件
+    存在但没有 drafts 表（完全空库或只有无关表）即视为版本不存在。成功时
+    返回 (连接, None)，调用方负责关闭连接；失败时返回 (None, 退出码)，
     错误信息已写入标准错误。
     """
-    if not os.path.exists(db_path):
-        return None, fail(f"Version not found: {version}")
-
-    conn = sqlite3.connect(db_path)
-    # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-    # 无关表）与路径不存在等价，统一按版本不存在处理，不补建
-    # drafts/changes、不插入草稿或变更，也不改动原有表结构与数据。此
-    # 查询只读 sqlite_master，不会开启写事务或产生 journal。
-    has_table = conn.execute(
-        "SELECT 1 FROM sqlite_master"
-        " WHERE type = 'table' AND name = 'drafts'"
-    ).fetchone()
-    if has_table is None:
-        conn.close()
+    conn = open_existing_draft_db(db_path)
+    if conn is None:
         return None, fail(f"Version not found: {version}")
 
     # 先确认草稿存在，再交由调用方定位条目或计算追加位置，避免给不
