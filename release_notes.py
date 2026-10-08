@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持十一个操作：
+支持十二个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
   list-drafts     列出全部已保存草稿的版本名与标题
@@ -11,6 +11,7 @@
   remove-change   按展示顺序删除已有草稿的一条变更
   move-change     按展示顺序移动已有草稿的一条变更
   rename-version  重命名已有草稿的版本名（标题与变更随版本名一起保留）
+  copy-version    在同一库内复制一份草稿（原版本保留，副本以新名称保存）
   export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
   export-changelog 按目录顺序把多份草稿汇总成一份 Markdown 导出到标准输出
 
@@ -370,7 +371,7 @@ def validate_change_index(indexes):
 
 def open_draft_for_update(db_path, version):
     """为 set-title / add-change / set-change / remove-change / move-change /
-    rename-version 打开已有数据库并确认版本存在。
+    rename-version / copy-version 打开已有数据库并确认版本存在。
 
     不创建数据库、不补建表：文件不存在，或文件存在但没有 drafts 表
     （完全空库或只有无关表）即视为版本不存在，这部分前置检查复用
@@ -660,6 +661,79 @@ def cmd_rename_version(args):
     return 0
 
 
+def cmd_copy_version(args):
+    # 仅允许一个 --to：未提供（None）、显式给出却缺值（nargs='?' 落空时
+    # 取空串常量）或重复提供（多于一个）都视为无效草稿。原版本名与新
+    # 版本名均非空白。校验全部发生在访问数据库之前，即使数据库文件或
+    # 原版本不存在也优先报 Invalid draft，失败时不会新建数据库文件。
+    to_names = args.to
+    if (
+        is_blank(args.version)
+        or to_names is None
+        or len(to_names) != 1
+        or is_blank(to_names[0])
+    ):
+        return fail("Invalid draft")
+    new_version = to_names[0]
+
+    # 文件存在性、drafts 表存在性与原版本存在性检查复用 set-title /
+    # add-change / set-change / remove-change / move-change / rename-version
+    # 共用的草稿访问流程：不创建数据库、不补建表、不改动原有表与数据，
+    # 失败信息已写入 stderr。原版本存在性在此确认，因此下面只需检查新名
+    # 称是否被另一草稿占用。
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
+    try:
+        try:
+            with conn:
+                # 在同一事务内按当前展示顺序（position 升序）读取原草稿的
+                # 标题与全部变更并完成复制：复制以原草稿此刻内容为准，已经
+                # 删除或移动过条目的草稿按当前顺序与现存条目复制，不去重、
+                # 不裁剪、不转义，多行文本仍是一条记录。
+                draft = read_draft_on_conn(conn, args.version)
+                if draft is None:
+                    # 极端兜底：目录行存在但草稿行在读取过程中被其他事务
+                    # 删除。
+                    return fail(f"Version not found: {args.version}")
+                title, changes = draft
+
+                # 原版本存在后再检查新名称占用：原名与新名完全相同（按原文
+                # 逐字符比较，区分大小写）也属于已占用，报 Version already
+                # exists，原草稿保持不变。
+                conflict = conn.execute(
+                    "SELECT 1 FROM drafts WHERE version = ?", (new_version,)
+                ).fetchone()
+                if conflict is not None:
+                    return fail(f"Version already exists: {new_version}")
+
+                # 同一事务内插入新草稿行与全部变更行：标题、变更原文、
+                # 条目数量与展示顺序与原草稿当前内容一致，重复文本分别
+                # 复制为独立记录，多行文本仍是一条记录。副本的 position
+                # 从 0 连续编号；新名称、标题与变更按原文原样保存，不裁剪
+                # 空白、不转义。原草稿与其他版本均不受影响。
+                conn.execute(
+                    "INSERT INTO drafts(version, title) VALUES (?, ?)",
+                    (new_version, title),
+                )
+                conn.executemany(
+                    "INSERT INTO changes(version, position, content)"
+                    " VALUES (?, ?, ?)",
+                    [
+                        (new_version, position, content)
+                        for position, content in enumerate(changes)
+                    ],
+                )
+        except sqlite3.IntegrityError:
+            # 兜底：并发进程抢先创建同名版本时，事务回滚不留部分副本。
+            return fail(f"Version already exists: {new_version}")
+    finally:
+        conn.close()
+
+    print(f"Copied version: {args.version} -> {new_version}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -830,6 +904,28 @@ def build_parser():
         help="新版本名（必填且仅允许一个），按原文原样保存，不裁剪空白",
     )
     parser_rename_version.set_defaults(func=cmd_rename_version)
+
+    parser_copy_version = subparsers.add_parser(
+        "copy-version",
+        help="在同一库内复制一份草稿，原版本保留，副本以新名称保存",
+    )
+    parser_copy_version.add_argument(
+        "version", help="原版本名，按原文精确匹配，区分大小写"
+    )
+    # 与 rename-version 的 --to 完全一致：action="append" 使重复提供可被
+    # 计数（多于一个即无效）；nargs='?' 配合 const="" 让显式给出却缺值的
+    # --to 以空串进入处理函数而非触发 argparse 自带报错，从而统一报
+    # Invalid draft（退出码 1）。值不设 default，省略时为 None，同样视为
+    # 无效。
+    parser_copy_version.add_argument(
+        "--to",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="新版本名（必填且仅允许一个），按原文原样保存，不裁剪空白",
+    )
+    parser_copy_version.set_defaults(func=cmd_copy_version)
 
     return parser
 
