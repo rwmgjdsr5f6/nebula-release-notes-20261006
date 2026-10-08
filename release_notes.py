@@ -125,38 +125,48 @@ def open_drafts_readonly(db_path):
     return conn
 
 
+def read_draft_on_conn(conn, version):
+    """在已确认含 drafts 表的只读连接上按版本名原文精确读取单份草稿。
+
+    show、export-markdown 与 export-changelog 共用的唯一草稿读取流程，
+    单份读取与汇总读取不各自维护查询规则。返回 (标题原文, 变更原文列表)；
+    变更按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行
+    变更仍是一条记录。库内没有该版本（含仅大小写不同）时返回 None。
+    """
+    row = conn.execute(
+        "SELECT title FROM drafts WHERE version = ?", (version,)
+    ).fetchone()
+    if row is None:
+        return None
+    title = row[0]
+
+    changes = [
+        content
+        for (content,) in conn.execute(
+            "SELECT content FROM changes WHERE version = ?"
+            " ORDER BY position",
+            (version,),
+        )
+    ]
+    return title, changes
+
+
 def read_draft(db_path, version):
     """按版本名原文精确读取草稿，供 show 与 export-markdown 共用。
 
     只读操作，不创建数据库、不补建表：数据库文件不存在、文件存在但
     没有 drafts 表（完全空库或只有无关表）、或库内没有该版本（含仅
-    大小写不同）时返回 None；否则返回 (标题原文, 变更原文列表)，变更
-    按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行
-    变更仍是一条记录。
+    大小写不同）时返回 None；否则返回 (标题原文, 变更原文列表)。打开
+    连接后委托 read_draft_on_conn 完成读取，与 export-changelog 汇总
+    时的逐份读取走同一条流程，规则只维护一份。
     """
     conn = open_drafts_readonly(db_path)
     if conn is None:
         return None
     try:
-        row = conn.execute(
-            "SELECT title FROM drafts WHERE version = ?", (version,)
-        ).fetchone()
-        if row is None:
-            return None
-        title = row[0]
-
-        changes = [
-            content
-            for (content,) in conn.execute(
-                "SELECT content FROM changes WHERE version = ?"
-                " ORDER BY position",
-                (version,),
-            )
-        ]
+        return read_draft_on_conn(conn, version)
     finally:
         conn.close()
-
-    return title, changes
 
 
 def cmd_show(args):
@@ -305,30 +315,6 @@ def cmd_export_changelog(args):
     # 呈现为一个空行间隔），最后一份之后不追加任何内容。
     sys.stdout.write("\n".join(fragments))
     return 0
-
-
-def read_draft_on_conn(conn, version):
-    """在已打开的只读连接上读取单份草稿，供 export-changelog 汇总使用。
-
-    返回 (标题原文, 变更原文列表)；变更按展示顺序（position 升序）读取，
-    不去重、不裁剪、不转义，多行变更仍是一条记录。草稿行在目录读取后
-    被并发删除时返回 None。
-    """
-    row = conn.execute(
-        "SELECT title FROM drafts WHERE version = ?", (version,)
-    ).fetchone()
-    if row is None:
-        return None
-    title = row[0]
-    changes = [
-        content
-        for (content,) in conn.execute(
-            "SELECT content FROM changes WHERE version = ?"
-            " ORDER BY position",
-            (version,),
-        )
-    ]
-    return title, changes
 
 
 def cmd_set_title(args):
