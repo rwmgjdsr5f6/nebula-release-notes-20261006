@@ -1,0 +1,471 @@
+================================================================================
+export-changelog 汇总导出 —— 源码流程说明（纯文本，静态核对 + 实际观察）
+================================================================================
+
+核对日期：2026-10-08
+核对目录：/mnt/c/NebulaForge/projects/forge13/solverA/task048
+核对方法：以阅读公开说明与源码、按代码路径静态推演为主；另在仓库之外的
+          临时目录（/tmp/ec_demo）用两份虚构草稿实际运行了导出命令以
+          核对字节级结果。凡结论均注明“静态推演”或“实际观察”；两者
+          一致的条目合并表述并分别标注。可沿给出的函数名与行号逐条复核。
+          实际观察未改动仓库内任何文件，未在仓库目录创建数据库。
+材料读取情况：全部可读，无“证据不可读取，无法确认”项。
+  - README.md（公开说明，548 行）
+  - release_notes.py（唯一源码，943 行）
+  - tests/test_export_changelog.py、tests/test_export_markdown.py
+    （导出回归测试，仅作旁证；本说明结论只以 release_notes.py 与
+    README.md 为准）
+  - .gitignore（*.sqlite 等数据库文件被忽略）
+
+行号引用格式：release_notes.py:行号、README.md:行号（对应当前版本）。
+范围限定：仅 export-changelog 子命令，覆盖一次导出从命令输入到最终文本
+的完整路径：参数检查、数据库与 drafts 表检查、草稿选择、逐份读取、片段
+生成与输出。保留所有现有命令、数据库结构和数据行为，本说明不提议任何
+改动。create / export-markdown / list-drafts 等仅在被复用时引用。
+
+
+--------------------------------------------------------------------------------
+一、公开入口与参数定义（README 公开约定 vs 当前实现细节）
+--------------------------------------------------------------------------------
+
+1. 公开用法（README 约定，属公开契约）
+   - 全部操作经 --db 指定同一个 SQLite 文件：README.md:14-18。
+   - 汇总导出小节：README.md:132-166
+       python release_notes.py --db notes.sqlite export-changelog
+       python release_notes.py --db notes.sqlite export-changelog --prefix <文本>
+   - 公开约定的要点（README.md:139-166）：省略 --prefix 时汇总全部草稿；
+     前缀只匹配版本名，区分大小写、不裁剪空白，% 和 _ 是普通字符，标题
+     与变更不参与匹配；选中的草稿与排列同 list-drafts 一致，按版本名
+     Unicode 码点升序；每份片段逐字等同于 export-markdown 的成功输出，
+     相邻片段间额外插入恰好一个换行，最后一份之后不追加任何内容；非法
+     --prefix 退出 1 且 stderr 恰为 Invalid draft 加换行；无匹配、库
+     不存在、无 drafts 表、表为空时退出 0 且两个输出流均为空；不建库、
+     不补表、不生成输出文件、不改动已有数据。
+
+2. 进程入口与分发（当前实现细节）
+   - 入口：release_notes.py:933-939，main() 的返回值即进程退出码
+     （942-943 行 sys.exit(main())）。
+   - 输出编码：release_notes.py:935-936，stdout/stderr 均 reconfigure
+     为 UTF-8，中文、空格、换行按原文输出，不依赖运行环境区域设置。
+   - --db 为必填全局参数：release_notes.py:741（required=True）；
+     子命令必填：release_notes.py:742。
+   - export-changelog 子命令注册：release_notes.py:785-803，处理函数
+     cmd_export_changelog（release_notes.py:277-318，绑定于 803 行），
+     经 release_notes.py:938-939 的 args.func(args) 分发调用。
+   - --prefix 参数定义：release_notes.py:794-802
+       action="append"（795 行）：每出现一次就向列表追加一个值，
+       因而重复提供可被计数；
+       nargs="?"（796 行）配合 const=""（797 行）：--prefix 显式出现
+       却没有值时，以空串进入处理函数，而不是触发 argparse 自带报错；
+       不设 default（794-802 行无 default=）：整条选项省略时为 None，
+       表示“不筛选、汇总全部草稿”。
+     该定义与 list-drafts 的 --prefix（release_notes.py:766-774）逐项
+     相同，源码注释 789-793 行明示两处规则完全一致。
+
+3. 数据库结构（样例数据的存放位置；本说明不改变它）
+   release_notes.py:29-41 的 SCHEMA：
+     drafts(version TEXT PRIMARY KEY, title TEXT NOT NULL)
+     changes(id INTEGER PRIMARY KEY AUTOINCREMENT, version TEXT NOT NULL,
+             position INTEGER NOT NULL, content TEXT NOT NULL,
+             FOREIGN KEY(version) REFERENCES drafts(version))
+   建表语句只在 create 流程执行（release_notes.py:72）；export-changelog
+   路径上不执行 SCHEMA，这点在第二、六节展开。
+
+
+--------------------------------------------------------------------------------
+二、cmd_export_changelog 的分支路径总览（release_notes.py:277-318）
+--------------------------------------------------------------------------------
+
+按源码先后顺序，进入函数后只有以下判定分支：
+
+  步骤 A  参数校验（281-283 行；先于任何数据库访问）
+    281  prefix, valid = validate_draft_prefix(args.prefix)
+    282  if not valid:
+    283      return fail("Invalid draft")          -- 唯一失败分支
+    validate_draft_prefix（release_notes.py:186-199，与 list-drafts 共用）：
+      195-196  省略（None）→ 返回 (None, True)，不筛选；
+      197-198  数量不为 1（重复提供）或值经 is_blank 判定为空白
+               → 返回 (None, False)，由 283 行报 Invalid draft；
+      199      否则返回 (前缀原文, True)，不裁剪、不转换。
+    空白判定 is_blank：release_notes.py:44-46
+    （text == "" or text.isspace()，空串或全部为空白字符即真）；
+    fail：release_notes.py:49-52（51 行向 stderr 打印消息，print 补一个
+    换行；52 行返回退出码 1）。
+
+  步骤 B  数据库与 drafts 表检查（288-290 行，只读打开）
+    288  conn = open_drafts_readonly(args.db)
+    289  if conn is None:
+    290      return 0                              -- 库/表缺失即空结果
+    open_drafts_readonly（release_notes.py:103-126，show / export-markdown /
+    list-drafts / export-changelog 共用）：
+      112-113  os.path.exists 为假 → 返回 None，不连接、不建库；
+      115      文件存在才 sqlite3.connect；
+      119-122  只读查询 sqlite_master 确认 drafts 表存在；
+      123-125  没有 drafts 表（完全空库或只有无关表）→ 关闭并返回 None，
+               不补建 drafts/changes。
+    该连接上不执行任何建表或写入语句（docstring 104-111 行明示）。
+
+  步骤 C  草稿选择（294 行）
+    294  rows = select_draft_rows(conn, prefix)
+    select_draft_rows（release_notes.py:202-216，与 list-drafts 共用）：
+      212      SELECT version, title FROM drafts  -- 无 WHERE、无 LIKE，
+                                                  不读取 changes 表
+      213-214  prefix 非 None 时在 Python 侧按版本名原文
+               row[0].startswith(prefix) 逐字符筛选
+      215      rows.sort(key=lambda row: row[0])  -- Python 字符串比较，
+               即 Unicode 码点升序，前缀相同时较短名称在前
+
+  步骤 D  逐份读取（296-303 行）
+    297-303  对选中每一行调用 read_draft_on_conn(conn, version)
+    read_draft_on_conn（release_notes.py:129-152，单份草稿读取规则的唯一
+    实现，show / export-markdown / export-changelog 均经由此函数）：
+      138-142  SELECT title FROM drafts WHERE version = ?（原文精确匹配，
+               含仅大小写不同的名称不命中）；
+      144-151  SELECT content FROM changes WHERE version = ?
+               ORDER BY position                   -- 按展示顺序读取，
+               不去重、不裁剪、不转义，多行变更仍是一条记录。
+    299-302  极端兜底：目录行存在但草稿在读取过程中被其他事务删除时
+             跳过该行，绝不报错、绝不补建。
+
+  步骤 E  片段生成（304-306 行）
+    304-306  fragments.append(render_draft_markdown(version, title, changes))
+    render_draft_markdown（release_notes.py:245-257，export-markdown 与
+    export-changelog 共用）：固定格式逐字拼接
+      "# " + 版本名原文 + 两个换行；标题原文 + 两个换行；
+      每条变更加 "- " 前缀和一个换行（255-257 行）。全程不转义、不整理
+      空白。export-markdown 的成功输出就是对同一函数结果的直接写出
+      （release_notes.py:273），因此单个片段与 export-markdown 输出
+      逐字一致。
+
+  步骤 F  空结果（310-312 行）
+    311-312  if not fragments: return 0           -- 连换行都不输出
+
+  步骤 G  拼接与输出（314-318 行）
+    317  sys.stdout.write("\n".join(fragments))
+    318  return 0
+    相邻片段之间额外插入恰好一个换行（片段本身已以一个换行结尾，故呈现
+    为一个空行间隔）；最后一份之后不追加任何内容。finally 中关闭连接：
+    307-308 行。
+
+README 对应约定：筛选语义 README.md:139-143；选取与排序
+README.md:144-147；片段与拼接格式 README.md:148-155；非法前缀
+README.md:156-159；空结果 README.md:160-162；只读性 README.md:163-166。
+
+
+--------------------------------------------------------------------------------
+三、前缀匹配与排序规则（源码依据）
+--------------------------------------------------------------------------------
+
+1. 前缀只匹配版本名，区分大小写、不裁剪空白
+   筛选就是 Python 的 str.startswith（release_notes.py:214），作用于
+   row[0]（版本名）；前缀原文在 validate_draft_prefix 的 199 行返回后
+   不经 strip/lower/任何转换。标题与变更不参与匹配：SELECT 只取
+   version、title 两列（212 行），筛选只用 row[0]，title（row[1]）仅
+   用于 list-drafts 的输出，在 export-changelog 中于 297 行解包为
+   _title 后被丢弃，片段标题改由 read_draft_on_conn 重新按版本名读取
+   （298-303 行）。约定：README.md:141-143。
+
+2. % 与 _ 是普通字符
+   全程没有 SQL LIKE：212 行是无 WHERE 的 SELECT，214 行在 Python 侧
+   匹配，'%'(U+0025) 与 '_'(U+005F) 只匹配各自的字面字符
+   （README.md:142-143；help 文本 release_notes.py:799-801）。
+
+3. 省略 --prefix 时汇总全部草稿
+   参数无 default（release_notes.py:794-802），省略时 args.prefix 为
+   None，validate_draft_prefix 走 195-196 行返回 (None, True)，
+   select_draft_rows 的 213-214 行筛选整段跳过，全部草稿进入排序与
+   导出。约定：README.md:139-140。
+
+4. 版本按 Unicode 码点顺序排列
+   215 行 rows.sort(key=lambda row: row[0]) 是 Python 字符串比较：按
+   Unicode 码点逐字符升序，前缀相同时较短名称在前，不合并大小写不同
+   的名称，不解析语义版本。条目按当前展示顺序输出（ORDER BY position，
+   147-150 行），重复文本分别保留（不去重），多行变更仍是一条记录。
+   约定：README.md:144-147、152-153。
+
+
+--------------------------------------------------------------------------------
+四、片段生成与输出格式（源码依据）
+--------------------------------------------------------------------------------
+
+1. 单个片段与 export-markdown 输出逐字一致
+   两处共用 render_draft_markdown（release_notes.py:245-257）：
+   export-markdown 在 273 行直接写出该函数结果；export-changelog 在
+   304-306 行把同一函数结果收入 fragments。源码 docstring（251-253 行）
+   明示“不允许各写一份拼接逻辑”。约定：README.md:149-150。
+
+2. 片段间额外插入一个换行，末份之后不追加内容
+   317 行 "\n".join(fragments)：每份片段已以最后一条变更自带的一个
+   换行结尾（256-257 行），join 在相邻片段间再插入恰好一个换行，呈现
+   为一个空行间隔；join 不在末尾追加任何内容，故最后一份片段的结尾
+   换行就是整个输出的最后一个字节。约定：README.md:150-151。
+
+3. 原文保持不变
+   版本名、标题、变更从数据库取出后只做固定格式拼接：不去重、不裁剪
+   空白、不转义，原文中的首尾空格和内部换行保持不变；多行变更只在
+   首行前加 "- "，内部换行原样保留（render_draft_markdown 245-257 行；
+   read_draft_on_conn 144-151 行）。约定：README.md:151-153。
+
+
+--------------------------------------------------------------------------------
+五、失败优先级：非法 --prefix 先于一切数据库访问
+--------------------------------------------------------------------------------
+
+非法取值（validate_draft_prefix 197-198 行逐一覆盖）：
+  - 显式缺值：--prefix 位于末尾且不带值（nargs="?" + const=""，
+    release_notes.py:796-797，空串进入处理函数）；
+  - 显式空字符串：--prefix ""（is_blank 的 == 分支，45 行）；
+  - 仅含空白：--prefix "   "、" \t\n "（str.isspace() 分支，45 行，
+    制表/换行也算空白）；
+  - 重复提供：--prefix v1 --prefix v1、--prefix v1 --prefix v2
+    （action="append" 使 len(prefixes)==2，197 行 len != 1 即拒，
+    与两个值是否合法无关）。
+
+静态推演路径：
+  281 行校验失败 → 283 行 return fail("Invalid draft")；fail
+  （49-52 行）向 stderr 打印消息并由 print 补一个换行，返回 1，经
+  938-939、942-943 行成为进程退出码。此路径上没有任何 stdout 写入，
+  317 行不可达 → 标准输出为空。数据库访问全部在校验之后
+  （open_drafts_readonly 在 288 行），不可达 → 即使 --db 指向的路径
+  不存在，也不会创建数据库文件，目录下不产生任何其他文件。
+  约定：README.md:156-159（校验优先于数据库读取，即使数据库文件不
+  存在也优先返回此错误且不创建任何文件）。
+
+静态推演预期（逐字节）：
+  退出码：1
+  标准输出：空
+  标准错误：恰为 "Invalid draft" 加一个换行（\n），除此之外无任何内容
+
+实际观察（/tmp/ec_demo，数据库 missing.sqlite 不存在）：
+  python release_notes.py --db missing.sqlite export-changelog --prefix
+  → 退出码 1；stdout 0 字节；stderr 经 od -c 核对恰为
+    I n v a l i d   d r a f t \n（13 字节）；missing.sqlite 未被创建。
+  另实测 --prefix "  "（仅空白）与 --prefix v1 --prefix v2（重复提供）
+  在数据库存在时同样：退出码 1，stdout 0 字节，stderr 恰为上述 13 字节。
+  与静态推演一致。
+
+
+--------------------------------------------------------------------------------
+六、四种“有效输入但无输出”：退出码 0，两个输出流均为空
+--------------------------------------------------------------------------------
+
+前提都是参数先通过了 281-283 行校验；非法前缀不享受空结果待遇（见
+第五节）。四种已约定情形（README.md:160-162）：
+
+  情形                          源码路径（release_notes.py）        副作用
+  ----------------------------  ----------------------------------  --------
+  1. 合法前缀无匹配              212 取数；213-214 筛选后 rows 为空；  无
+                                296-306 循环不执行；311-312 返回 0
+  2. --db 指向的文件不存在       112-113 返回 None；289-290 返回 0    不建库
+  3. 文件存在但没有 drafts 表    119-122 查 sqlite_master 得 None；    不补表
+    （完全空库或只有无关表）     123-125 关闭并返回 None；289-290
+  4. drafts 表存在但表内无草稿   212 SELECT 取回空列表；311-312        不写行
+
+输出契约：四种情形统一退出码 0，标准输出与标准错误都为空——连换行都
+不输出（310-312 行在写出之前返回，317 行不可达；成功路径不写 stderr）。
+
+“不建库、不补表”的源码依据：
+  - SCHEMA（release_notes.py:29-41）在整个 export-changelog 路径上从未
+    被执行；它只在 cmd_create 的 72 行经 executescript 建立。
+  - open_drafts_readonly（103-126 行）对库结构的全部探测只是只读的
+    sqlite_master 查询（119-122 行），docstring 118 行附近明示“不会
+    开启写事务或产生 journal”；文件不存在时连 sqlite3.connect 都不
+    发生（112 行门控 115 行）。
+
+实际观察（/tmp/ec_demo）：
+  - --prefix v9（库存在、无匹配）：退出码 0，stdout 0 字节，stderr 0 字节；
+  - --db absent.sqlite（不存在）：退出码 0，两流均 0 字节，absent.sqlite
+    未被创建；
+  - 空 drafts 表（有表无行）：退出码 0，两流均 0 字节；
+  - 只有无关表、无 drafts 表：退出码 0，两流均 0 字节，未补建表。
+  与静态推演一致。
+
+
+--------------------------------------------------------------------------------
+七、只读性与跨进程结果稳定（不建库、不补表、不生成文件、不改数据）
+--------------------------------------------------------------------------------
+
+1. 不建库、不补表、不生成导出文件、不改变已有数据（源码依据）
+   cmd_export_changelog 函数体（release_notes.py:277-318）及其调用的
+   open_drafts_readonly（103-126）、select_draft_rows（202-216）、
+   read_draft_on_conn（129-152）中只有 SELECT 语句（sqlite_master、
+   drafts、changes 各一条），没有 CREATE/INSERT/UPDATE/DELETE，没有
+   executescript(SCHEMA)，也没有 with conn 事务或 commit。唯一的输出
+   是 317 行的 sys.stdout.write：命令不接收输出路径，不创建任何发布
+   说明文件，需要保存时由终端重定向。已有草稿的名称、标题、条目数量
+   与顺序保持不变。约定：README.md:163-166；模块 docstring
+   release_notes.py:18-19。
+
+2. 数据未变化时，新进程得到相同文本
+   每次进程都从 main 重新解析参数、重新连接（release_notes.py:933-939），
+   输出只由 drafts/changes 当前内容决定：筛选（214 行）、排序（215 行）
+   与拼接（255-257、317 行）都是确定性的纯函数。212 行的 SELECT 本身
+   没有 ORDER BY，物理返回顺序不具契约意义；215 行的 Python 排序使
+   最终顺序对同一数据恒定，因此不同进程、重复执行得到逐字节相同的
+   stdout（README.md:165-166：“另一个进程使用同一路径汇总得到完全
+   一致的文本”）。
+
+
+--------------------------------------------------------------------------------
+八、可复核示例：两份虚构草稿的两次导出
+--------------------------------------------------------------------------------
+
+数据准备（创建流程：cmd_create，release_notes.py:55-100；非空白校验
+61-68 行；建库建表 70-72 行；写 drafts 与 changes 在同一事务 74-92 行）。
+严格按以下顺序创建——先 v2，后 v10：
+
+  python release_notes.py --db notes.sqlite create v2 \
+    --title "含 v1 的标题" --change "修正文案"
+  # 退出码 0，stdout：Created v2
+
+  python release_notes.py --db notes.sqlite create v10 \
+    --title "预览十" --change "新增查询" --change "新增查询"
+  # 退出码 0，stdout：Created v10
+
+于是数据库中：
+  drafts：  (v2, 含 v1 的标题)、(v10, 预览十)
+  changes： v2 一条（position 0，修正文案）；
+            v10 两条（position 0 与 1，内容均为“新增查询”——重复文本
+            分别保存为独立记录，create 不去重，release_notes.py:85-92）。
+注意 v2 的标题“含 v1 的标题”中含有子串“v1”，用于验证标题不参与
+前缀筛选。
+
+第一次导出（省略 --prefix，汇总全部草稿）：
+
+  输入：
+    python release_notes.py --db notes.sqlite export-changelog
+
+  静态推演（沿第二节路径）：
+    A. args.prefix 为 None → 195-196 行，不筛选；
+    B. notes.sqlite 存在且有 drafts 表 → 288 行连接成功；
+    C. 212 行取回 (v2, …)、(v10, …) 两行；213-214 行跳过；
+       215 行按码点排序：'v'='v'，'1'(U+0031) < '2'(U+0032)，
+       故 v10 排在 v2 之前——与创建顺序（先 v2 后 v10）相反，
+       也与语义版本直觉（2 < 10）相反，证明只按码点；
+    D-E. 逐份读取并渲染：v10 片段含两条相同的“- 新增查询”
+       （重复文本分别保留，不去重）；v2 片段含一条“- 修正文案”；
+    G. 317 行 "\n".join：两片段之间恰好多一个换行，末份之后无追加。
+
+  预期标准输出（退出码 0，标准错误为空；为明确表示换行，逐行列出，
+  每行末尾各有一个 \n，最后一行“- 修正文案”之后也恰有一个 \n，
+  其后无任何内容）：
+
+# v10
+
+预览十
+
+- 新增查询
+- 新增查询
+
+# v2
+
+含 v1 的标题
+
+- 修正文案
+
+  即字节序列：
+    "# v10\n\n预览十\n\n- 新增查询\n- 新增查询\n"
+    + "\n"
+    + "# v2\n\n含 v1 的标题\n\n- 修正文案\n"
+  （两片段之间的空行 = v10 片段结尾换行 + join 插入的一个换行。）
+
+  实际观察（/tmp/ec_demo）：退出码 0；stderr 0 字节；stdout 经 od -c
+  核对与上述字节序列逐字节一致（中文按 UTF-8 三字节编码原样输出）。
+
+第二次导出（追加 --prefix v1）：
+
+  输入：
+    python release_notes.py --db notes.sqlite export-changelog --prefix v1
+
+  静态推演：
+    A. args.prefix == ["v1"]，非空白 → 199 行返回 ("v1", True)；
+    C. 214 行 str.startswith("v1") 只作用于版本名：
+         "v10"：v,1 与前缀相同，后续还有 '0' → 命中；
+         "v2" ：第二字符 '2'(U+0032) ≠ '1'(U+0031) → 不命中。
+       v2 的标题“含 v1 的标题”虽含子串“v1”，但标题从不参与匹配
+       （212 行取出后于 297 行被丢弃，筛选只用 row[0]）→ 仍不命中。
+       本例由此证明标题不参与筛选；
+    D-G. 仅渲染 v10 一份；单份片段无 join 间隔，末份之后不追加，
+       输出与 export-markdown v10 逐字相同。
+
+  预期标准输出（退出码 0，标准错误为空；每行末尾各有一个 \n，
+  最后一行“- 新增查询”之后恰有一个 \n，其后无任何内容）：
+
+# v10
+
+预览十
+
+- 新增查询
+- 新增查询
+
+  预期标准错误：空。预期退出码：0。
+
+  实际观察（/tmp/ec_demo）：退出码 0；stderr 0 字节；stdout 与上述
+  文本逐字节一致；另将 export-markdown v10 的输出与该结果用 diff
+  比对，完全相同（印证第四节第 1 条“单片段逐字一致”）。
+
+复核方式：以上两次导出的每一步都可沿引用的函数与行号在
+release_notes.py 中静态复核（validate_draft_prefix 186-199 →
+open_drafts_readonly 103-126 → select_draft_rows 202-216 →
+read_draft_on_conn 129-152 → render_draft_markdown 245-257 →
+cmd_export_changelog 317-318）；数据未变化时，结束当前进程后在
+新进程中用同一数据库路径重跑任一命令，得到逐字节相同的文本
+（第七节第 2 条）。
+
+
+--------------------------------------------------------------------------------
+九、未约定情形：不推定为空结果
+--------------------------------------------------------------------------------
+
+第六节目录化地穷尽了 README 承诺“退出 0、两流皆空”的四种情形；除此
+之外不对结果做推定。下列情形 README 与 help 均未约定，静态核对时不得
+比照第六节假定为“退出 0、无输出”：
+
+  - --db 指向存在但损坏的文件（不是合法 SQLite 数据库）：112 行通过、
+    115 行惰性连接不立即报错，119-122 行执行查询时将抛出
+    sqlite3.DatabaseError。cmd_export_changelog 内没有 except 捕获
+    （307-308 行的 finally 只负责 close），main（933-939 行）也没有
+    捕获，按 Python 默认行为是向 stderr 打印 traceback、以非零码退出。
+    此为源码层面的静态观察，并非 README 约定结果，实际表现以运行为准。
+  - drafts 表存在但缺少 version/title 列，或 changes 表缺失/缺列：
+    212、138-151 行将抛 sqlite3.OperationalError，同属未捕获路径，
+    同样不应推定为空结果。
+  - 文件权限、目录不可访问等环境性错误：README 未约定。
+  - 缺少必填的 --db、未知子命令、未知参数等：由 argparse 在
+    release_notes.py:938 解析阶段自行报错退出（argparse 惯例为退出码
+    2、英文 usage 信息），发生在进入 cmd_export_changelog 之前，不属于
+    “Invalid draft”（退出码 1）分支。
+
+
+--------------------------------------------------------------------------------
+附：分支与结论速查表
+--------------------------------------------------------------------------------
+
+结论                            退出码  stdout          stderr           源码（release_notes.py）        README.md
+------------------------------  ------  --------------  ---------------  ------------------------------  --------
+省略 --prefix，汇总全部草稿      0      Markdown 片段   空               195-196,213 跳过,215,304-306,317  139-155
+合法前缀有命中（示例 v1→v10）    0      命中片段        空               199,214,215,304-306,317         139-155
+合法前缀无匹配                  0      空              空               213-214 → 空,311-312            160-162
+数据库文件不存在（参数合法）     0      空              空               112-113,289-290；不建库         160-162
+合法 SQLite 无 drafts 表        0      空              空               119-125,289-290；不补表         160-162
+drafts 表存在但无草稿            0      空              空               212 空结果,311-312              160-162
+--prefix 缺值/空串/纯空白        1      空              Invalid draft\n  44-46,197-198,281-283,49-52     156-159
+--prefix 重复提供                1      空              Invalid draft\n  197（len!=1）,283；795          156-159
+非法前缀 + 数据库不存在          1      空              Invalid draft\n  283 先于 288 返回；不建库        156-159
+损坏数据库 / 表结构异常          未约定  不推定为空      不推定（第九节） 异常未捕获：119-122 等抛出       无约定
+
+关键函数索引：
+  cmd_export_changelog ......... release_notes.py:277-318
+  validate_draft_prefix ........ release_notes.py:186-199（list-drafts 共用）
+  open_drafts_readonly ......... release_notes.py:103-126（只读打开，不建库不补表）
+  select_draft_rows ............ release_notes.py:202-216（筛选与排序）
+  read_draft_on_conn ........... release_notes.py:129-152（单份读取唯一实现）
+  render_draft_markdown ........ release_notes.py:245-257（片段拼接唯一实现）
+  cmd_export_markdown .......... release_notes.py:260-274（单份导出，273 行共用渲染）
+  is_blank ..................... release_notes.py:44-46
+  fail ......................... release_notes.py:49-52
+  --prefix 参数定义 ............ release_notes.py:794-802
+  --db / 子命令必填 ............ release_notes.py:741-742
+  入口、分发、编码 ............. release_notes.py:933-943
+  SCHEMA（export-changelog 不执行） release_notes.py:29-41；仅 create
+                                 在 release_notes.py:72 执行
