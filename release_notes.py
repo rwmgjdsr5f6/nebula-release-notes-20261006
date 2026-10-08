@@ -98,28 +98,52 @@ def cmd_create(args):
     return 0
 
 
-def read_draft(db_path, version):
-    """按版本名原文精确读取草稿，供 show 与 export-markdown 共用。
+def drafts_table_exists(conn):
+    """连接内是否存在 drafts 表。
 
-    只读操作，不创建数据库、不补建表：数据库文件不存在、文件存在但
-    没有 drafts 表（完全空库或只有无关表）、或库内没有该版本（含仅
-    大小写不同）时返回 None；否则返回 (标题原文, 变更原文列表)，变更
-    按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行
-    变更仍是一条记录。
+    show / export-markdown / list-drafts 三条只读入口共用的唯一前置表
+    检查：只读 sqlite_master，不执行任何建表语句、不开启写事务；文件
+    存在但没有 drafts 表（完全空库或只有无关表）时返回 False，由调用方
+    按空目录或版本不存在处理，不补建 drafts/changes。
+    """
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master"
+        " WHERE type = 'table' AND name = 'drafts'"
+    ).fetchone() is not None
+
+
+def open_draft_reader(db_path):
+    """打开只读草稿访问连接，集中三条只读入口共用的前置检查。
+
+    路径不存在，或文件存在但没有 drafts 表（完全空库或只有无关表）时
+    返回 None：目录查询据此输出空数组，单版本查询据此报版本不存在。
+    成功时返回已打开的连接，由调用方负责关闭。全程只读：不创建数据库
+    文件、不补建 drafts/changes、不改动任何已有表与数据；此流程的查询
+    只触及 sqlite_master 与 drafts/changes 的 SELECT，不会产生写事务。
     """
     if not os.path.exists(db_path):
         return None
 
     conn = sqlite3.connect(db_path)
+    if not drafts_table_exists(conn):
+        conn.close()
+        return None
+    return conn
+
+
+def read_draft(db_path, version):
+    """按版本名原文精确读取单个草稿，供 show 与 export-markdown 共用。
+
+    路径存在性、连接与 drafts 表存在性等前置检查统一走
+    open_draft_reader：任一不满足即返回 None；库内没有该版本（含仅大小
+    写不同）时同样返回 None。成功时返回 (标题原文, 变更原文列表)，变更
+    按展示顺序（position 升序）读取，不去重、不裁剪、不转义，多行变更
+    仍是一条记录。
+    """
+    conn = open_draft_reader(db_path)
+    if conn is None:
+        return None
     try:
-        # 不执行任何建表语句：文件存在但没有 drafts 表时（完全空库或只有
-        # 无关表）与空目录等价，按版本不存在处理，不补建 drafts/changes。
-        has_table = conn.execute(
-            "SELECT 1 FROM sqlite_master"
-            " WHERE type = 'table' AND name = 'drafts'"
-        ).fetchone()
-        if has_table is None:
-            return None
         row = conn.execute(
             "SELECT title FROM drafts WHERE version = ?", (version,)
         ).fetchone()
@@ -139,6 +163,26 @@ def read_draft(db_path, version):
         conn.close()
 
     return title, changes
+
+
+def list_draft_items(conn, prefix=None):
+    """在已确认含 drafts 表的连接上读取目录，仅供 list-drafts 使用。
+
+    只查 drafts 的 version 与 title，不读取也不要求 changes 表。prefix
+    非 None 时在 Python 侧按版本名原文逐字符筛选：区分大小写、不裁剪
+    空白、不解析语义版本，中文与内部换行按原文比较，% 与 _ 是普通字符
+    （不经 SQL LIKE 通配），标题与变更内容不参与匹配。结果按版本名原文
+    逐字符（Unicode 码点）升序排列，前缀相同时较短名称在前；元素仅含
+    version 与 title 两个字段。
+    """
+    rows = conn.execute("SELECT version, title FROM drafts").fetchall()
+    if prefix is not None:
+        rows = [row for row in rows if row[0].startswith(prefix)]
+    rows.sort(key=lambda row: row[0])
+    return [
+        {"version": version, "title": title}
+        for version, title in rows
+    ]
 
 
 def cmd_show(args):
@@ -167,37 +211,14 @@ def cmd_list_drafts(args):
     else:
         prefix = None
 
-    # 只读目录查询：数据库文件不存在时直接输出空数组，不连接、不建库。
+    # 只读目录查询：路径不存在或文件存在但没有 drafts 表时，
+    # open_draft_reader 统一返回 None，按空目录输出 []；整个过程不连接
+    # 建库、不补建表，也不读取或要求 changes 表。
     items = []
-    if os.path.exists(args.db):
-        conn = sqlite3.connect(args.db)
+    conn = open_draft_reader(args.db)
+    if conn is not None:
         try:
-            # 不执行任何建表语句：文件存在但没有 drafts 表时与空库等价，
-            # 仍然输出 []，不补建表结构。
-            has_table = conn.execute(
-                "SELECT 1 FROM sqlite_master"
-                " WHERE type = 'table' AND name = 'drafts'"
-            ).fetchone()
-            if has_table is not None:
-                rows = conn.execute(
-                    "SELECT version, title FROM drafts"
-                ).fetchall()
-                if prefix is not None:
-                    # 前缀筛选在 Python 侧按版本名原文逐字符进行：区分
-                    # 大小写、不裁剪空白、不解析语义版本，中文与内部换行
-                    # 按原文比较；% 与 _ 是普通字符（不经 SQL LIKE 通配），
-                    # 标题与变更内容不参与匹配。
-                    rows = [
-                        row for row in rows if row[0].startswith(prefix)
-                    ]
-                # 排序在 Python 侧按版本名原文逐字符比较：即 Unicode
-                # 码点升序，前缀相同时较短名称在前，不做语义版本解析，
-                # 也不合并大小写不同的名称。
-                rows.sort(key=lambda row: row[0])
-                items = [
-                    {"version": version, "title": title}
-                    for version, title in rows
-                ]
+            items = list_draft_items(conn, prefix)
         finally:
             conn.close()
 
