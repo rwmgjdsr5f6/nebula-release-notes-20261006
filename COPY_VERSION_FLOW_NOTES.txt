@@ -1,0 +1,365 @@
+================================================================================
+复制草稿流程行为说明 —— copy-version 的命令输入、校验、查找、冲突检查与输出
+（纯文本，静态核对）
+================================================================================
+
+核对日期：2026-10-08
+仓库目录：/mnt/c/NebulaForge/projects/forge13/solverB/task047
+交付性质：新增文档。未改动产品代码、数据库结构、既有文档与任何命令
+          行为（release_notes.py、README.md、tests/ 及既有各说明
+          文件均保持原样；本说明不创建 notes.sqlite）。全部命令与
+          SQLite 表结构（SCHEMA，release_notes.py:29-41）保持兼容，
+          不新增任何产品功能。
+核对方法：只阅读公开使用文档（README.md）与源码（release_notes.py），
+          按代码路径静态推演；未执行 release_notes.py，未运行测试或
+          任何脚本。下文所有“预期输出 / 预期退出码”均为按源码静态
+          推演的结果，不是运行观测值；凡属源码推演而 README 未公开
+          承诺的细节，均逐条标注“源码推演”。
+
+证据材料：
+  - README.md            公开使用文档。copy-version 公开约定见
+                         README.md:290-320，show 输出格式见
+                         README.md:38-56，create 公开约定见
+                         README.md:20-36，remove-change 公开约定见
+                         README.md:232-258。
+  - release_notes.py     唯一源码（944 行）。本说明引用的关键函数：
+                           is_blank             release_notes.py:44-46
+                           fail                 release_notes.py:49-52
+                           open_drafts_readonly release_notes.py:103-126
+                           read_draft_on_conn   release_notes.py:129-152
+                           cmd_show             release_notes.py:173-183
+                           validate_change_index
+                                                release_notes.py:355-369
+                           open_draft_for_update
+                                                release_notes.py:372-394
+                           locate_change        release_notes.py:444-471
+                           cmd_remove_change    release_notes.py:515-551
+                           cmd_copy_version     release_notes.py:664-734
+                           build_parser 中 copy-version 的 --to 定义
+                                                release_notes.py:908-928
+                           main                 release_notes.py:933-939
+
+引用格式：README.md:行号、release_notes.py:行号（行号对应当前版本）。
+约定区分：文中“公开约定”指 README.md 明文记载、使用者可依赖的行为；
+          “源码推演”指仅由当前源码可推出、README 未逐字承诺的细节，
+          后者不视为对外契约，后续版本实现可变。
+
+验收数据（本说明固定使用，数据库文件固定为 notes.sqlite）：
+  原版本名：v1
+  标题：    预览
+  变更 1：  甲
+  变更 2：  临时        （准备阶段由 remove-change 删除，不参与复制）
+  变更 3：  重复
+  变更 4：  重复        （与变更 3 文本相同的重复记录）
+  新版本名：v2
+
+流程总览：create 准备原稿 v1 → remove-change 按展示序号删除第 2 条
+          （临时）→ copy-version v1 --to v2 在同一库内复制出副本 v2
+          → show v2 查看副本。随后逐条说明展示顺序如何决定复制结果、
+          文本保留规则、原稿与副本的独立性，以及失败优先级。
+
+
+--------------------------------------------------------------------------------
+一、准备：创建原稿 v1 并删除第 2 条变更（公开用法）
+--------------------------------------------------------------------------------
+
+1.1 创建原稿（与 README.md:22-23 的公开用法同形）：
+
+  python release_notes.py --db notes.sqlite create v1 \
+    --title "预览" \
+    --change "甲" \
+    --change "临时" \
+    --change "重复" \
+    --change "重复"
+
+  按源码静态推演（cmd_create，release_notes.py:55-100）：校验通过后
+  建库建表（SCHEMA 带 IF NOT EXISTS，release_notes.py:29-41），同一
+  事务内插入 drafts 行 ("v1", "预览") 与 changes 四行，position 取自
+  enumerate(changes)，从 0 起按传入顺序编号
+  （release_notes.py:85-92）：
+    ("v1", 0, "甲")
+    ("v1", 1, "临时")
+    ("v1", 2, "重复")
+    ("v1", 3, "重复")
+  两条 "重复" 是内容相同的两条独立记录，不去重（公开约定“重复内容
+  分别保留”，README.md:26-27）。预期结果（静态推演）：退出码 0，
+  标准错误为空，标准输出为 "Created v1" 加一个换行。
+
+1.2 删除第 2 条变更（公开用法见 README.md:234-235）：
+
+  python release_notes.py --db notes.sqlite remove-change v1 --index 2
+
+  按源码静态推演（cmd_remove_change，release_notes.py:515-551）：
+  locate_change（release_notes.py:444-471）按展示顺序（position
+  升序）定位第 2 条，即 position = 1 的 "临时" 记录；DELETE 只删除
+  该一条（release_notes.py:543-546），其余条目的 position 不重排
+  （注释 release_notes.py:539-542）。预期结果（静态推演）：退出码 0，
+  标准错误为空，标准输出为 "Removed change: v1 #2" 加一个换行。
+
+  删除后的存储状态（源码推演）：changes 表中 v1 剩三行，position
+  分别为 0、2、3（position 1 成为空洞）：
+    ("v1", 0, "甲")
+    ("v1", 2, "重复")
+    ("v1", 3, "重复")
+  展示顺序一律由读取处的 ORDER BY position 决定
+  （read_draft_on_conn，release_notes.py:144-151），因此当前展示
+  序号为：1 → 甲，2 → 重复，3 → 重复。这个“position 有空洞、展示
+  序号连续”的状态正是下一节复制行为的输入。
+
+
+--------------------------------------------------------------------------------
+二、核心流程：copy-version v1 --to v2
+--------------------------------------------------------------------------------
+
+命令行（公开用法，README.md:292-294）：
+
+  python release_notes.py --db notes.sqlite copy-version v1 --to v2
+
+注意 "->" 两侧各有一个空格：成功消息模板为
+f"Copied version: {args.version} -> {new_version}"
+（release_notes.py:733），公开约定同形（README.md:308-309）。
+
+按源码静态推演，处理顺序如下（cmd_copy_version，
+release_notes.py:664-734）：
+
+  (1) 参数解析（build_parser，release_notes.py:908-928）：子命令
+      copy-version 接收位置参数 version（原版本名）与选项 --to。
+      --to 定义为 action="append" + nargs='?' + const=""
+      （release_notes.py:920-927）：重复提供可被计数；显式给出却
+      缺值时以空串常量进入处理函数，而不触发 argparse 自带报错，
+      从而统一报 Invalid draft。省略时 args.to 为 None。
+
+  (2) 参数校验（release_notes.py:669-676）：以下任一成立即
+      fail("Invalid draft")（fail 定义见 release_notes.py:49-52，
+      向标准错误打印消息并返回退出码 1）：
+        - 原版本名为空或仅由空白组成（is_blank，
+          release_notes.py:44-46）；
+        - 未提供 --to（args.to 为 None）；
+        - 重复提供 --to（len(to_names) != 1）；
+        - 新名称（含缺值落空的空串）为空或仅由空白组成。
+      校验全部发生在访问数据库之前（注释 release_notes.py:665-668；
+      公开约定 README.md:310-313），即使数据库文件不存在也优先返回
+      此错误，且不创建数据库文件。
+
+  (3) 原稿查找（open_draft_for_update，release_notes.py:372-394，
+      在 release_notes.py:684 调用）：复用只读打开流程
+      open_drafts_readonly（release_notes.py:103-126）——数据库
+      文件不存在，或文件存在但没有 drafts 表（完全空库或只有无关
+      表）时返回 None，不建库、不补建表；随后在 drafts 表中按版本名
+      原文精确匹配（"WHERE version = ?" 参数绑定，
+      release_notes.py:388-390），区分大小写，仅大小写不同的名称
+      不匹配。任一失败即返回
+      fail(f"Version not found: {version}")（退出码 1），不创建
+      数据库、不补建表、不改动任何数据（公开约定
+      README.md:314-316）。
+
+  (4) 读取原稿当前内容（read_draft_on_conn，
+      release_notes.py:129-152，在 release_notes.py:694 调用）：
+      与 show / export-markdown 共用同一份读取实现。变更按
+      ORDER BY position 升序取出（release_notes.py:146-150），
+      不去重、不裁剪、不转义。本例取出标题 "预览" 与变更列表
+      ["甲", "重复", "重复"]——即按当前展示顺序的三条现存记录，
+      已删除的 "临时" 与 position 空洞均不出现。公开约定“已经删除
+      或移动过条目的草稿，以复制时的当前展示顺序为准”见
+      README.md:296-298。
+
+  (5) 名称冲突检查（release_notes.py:704-708）：在 drafts 表中按
+      原文精确查询新名称 "v2"。注意检查发生在原稿存在性确认之后，
+      因此“原稿不存在且新名已被占用”时仍报告原稿不存在（见第五节
+      失败次序）。原名与新名完全相同时，该查询必然命中原稿自身，
+      因此同名复制同样报 Version already exists（注释
+      release_notes.py:701-703；公开约定 README.md:317-318）。
+
+  (6) 同事务写入副本（with conn 事务，release_notes.py:689；
+      插入语句 release_notes.py:715-726）：
+        INSERT drafts：("v2", "预览")
+        INSERT changes 三行，position 取自 enumerate(changes)，
+        从 0 起连续编号（release_notes.py:719-726）：
+          ("v2", 0, "甲")
+          ("v2", 1, "重复")
+          ("v2", 2, "重复")
+      副本的 position 从 0 连续编号，不复制原稿的 position 空洞
+      （公开约定 README.md:299-301）。重复文本 "重复" 逐条复制为
+      两条独立记录，不去重。新名称、标题与变更按原文原样保存，
+      不裁剪空白、不转义（注释 release_notes.py:710-714；公开约定
+      README.md:302-303）。整个读取加写入在同一事务内，失败时
+      事务回滚，不留部分副本；并发进程抢先创建同名版本触发
+      IntegrityError 时同样回滚并报 Version already exists
+      （兜底，release_notes.py:727-729，属源码推演细节）。
+
+  (7) 结果输出（release_notes.py:733-734）：print 成功消息并
+      返回 0。
+
+预期结果（静态推演，非运行观测）：
+
+  退出码：    0
+  标准错误：  空（没有任何字符）
+  标准输出：  恰好一行，末尾恰有一个换行。逐字符为
+
+    Copied version: v1 -> v2\n
+
+  即 "Copied version:"、一个空格、"v1"、一个空格、"->"、一个
+  空格、"v2"，再接一个换行；除此之外没有任何提示语或空行。
+
+复制完成后的存储状态（源码推演）：drafts 表有 v1、v2 两行；changes
+表中 v1 的三行（position 0、2、3）原样保留，v2 新增三行
+（position 0、1、2）。两份草稿的记录完全独立。
+
+
+--------------------------------------------------------------------------------
+三、查看副本：show v2
+--------------------------------------------------------------------------------
+
+命令行（公开用法，README.md:40-41）：
+
+  python release_notes.py --db notes.sqlite show v2
+
+按源码静态推演（cmd_show，release_notes.py:173-183）：read_draft
+经 open_drafts_readonly 与 read_draft_on_conn 读取 v2，输出行为
+"\n".join(lines) + "\n"（release_notes.py:180-182），即首行
+"Version: v2"，次行 "Title: 预览"，随后每条变更按展示顺序加
+"- " 前缀各一行，末尾恰有一个换行。
+
+预期结果（静态推演，非运行观测）：
+
+  退出码：    0
+  标准错误：  空（没有任何字符）
+  标准输出：  恰好五行，每行末尾各有一个换行（含最后一行），
+              除此之外没有任何内容：
+
+    Version: v2\n
+    Title: 预览\n
+    - 甲\n
+    - 重复\n
+    - 重复\n
+
+  即版本名行为新名称 v2，标题行为原稿标题 "预览"，变更条目按
+  当前展示顺序依次为 "甲"、"重复"、"重复"；已删除的 "临时" 不出现，
+  两条 "重复" 作为两条独立记录分别列出（公开约定：show 依次输出
+  版本、标题和每条变更，README.md:44-51）。
+
+
+--------------------------------------------------------------------------------
+四、复制结果的来源：展示顺序、文本保留与两份草稿的独立性
+--------------------------------------------------------------------------------
+
+4.1 展示顺序如何决定复制结果
+
+  复制不是按 position 数值照搬，而是先按展示顺序（ORDER BY
+  position 升序，read_draft_on_conn，release_notes.py:146-150）
+  取出原稿当前现存的变更列表，再对这个列表 enumerate 重新从 0
+  连续编号写入副本（release_notes.py:719-726）。因此：
+    - 已删除的条目（本例 "临时"）不在列表中，不会被复制；
+    - 原稿删除后留下的 position 空洞（0、2、3）被压实为连续编号
+      （0、1、2），公开约定“副本条目的 position 从 0 连续编号
+      （不复制原草稿可能存在的 position 空洞）”，README.md:299-301；
+    - 副本的展示顺序与原稿复制时刻的展示顺序一致（公开约定
+      README.md:296-298）。本例中 show v1 与 show v2 的条目部分
+      逐行相同。
+
+4.2 重复记录、多行条目、中文与首尾空格的保留
+
+  - 重复记录：读取与写入都不去重（read_draft_on_conn 无 DISTINCT，
+    release_notes.py:144-151；executemany 逐条插入，
+    release_notes.py:719-726），两条 "重复" 复制为两条独立记录，
+    公开约定“重复文本分别保留”，README.md:299-300。
+  - 多行条目：变更按记录复制，content 内含换行的条目仍是一条
+    记录，不拆分；展示时只在首行前加 "- "（cmd_show，
+    release_notes.py:179-182；公开约定 README.md:53）。
+  - 中文与首尾空格：读取、插入均为参数绑定，原文原样传递，不
+    裁剪空白、不转义（注释 release_notes.py:710-714；公开约定
+    “新名称、标题与变更中的中文、标点、首尾空格及内部换行均原样
+    保留”，README.md:302-303）。输出侧 main 把标准输出/标准错误
+    固定为 UTF-8（release_notes.py:935-936），中文按原文输出。
+
+4.3 修改原稿与副本为何互不影响
+
+  复制完成后，v1 与 v2 在 drafts 表中是两行独立记录，在 changes
+  表中是按 version 列区分的两组独立行（SCHEMA，
+  release_notes.py:29-41）。复制是逐条 INSERT 出新行
+  （release_notes.py:715-726），不与原稿共享任何行；此后
+  set-title / set-change / remove-change / move-change 等命令都
+  以 "WHERE version = ?" 限定只作用于一个版本名（如
+  cmd_set_title 的 UPDATE，release_notes.py:341-347），因此对
+  任一份的修改不会触碰另一份的行。公开约定“复制完成后两份草稿
+  互不影响”，README.md:304-307。
+
+
+--------------------------------------------------------------------------------
+五、失败次序（优先级）与失败时的不变性
+--------------------------------------------------------------------------------
+
+以下次序按 cmd_copy_version 的代码路径静态推演
+（release_notes.py:664-734），与公开约定 README.md:310-320 一致。
+所有失败情形共同的外部表现（公开约定 README.md:319-320）：退出码
+1，标准输出为空，标准错误仅包含对应消息和一个换行；不创建数据库、
+不补建表、不修改旧稿、不留下部分副本。
+
+  第 1 级 参数校验（release_notes.py:669-676）→ Invalid draft
+    触发条件：原版本名或新版本名为空 / 仅由空白组成；未提供
+    --to；显式给出 --to 却缺值（落空为空串，同样因空白被判无效）；
+    重复提供 --to。
+    该校验先于任何数据库访问：即使数据库文件不存在、即使原稿
+    不存在、即使新名已被占用，也优先返回 Invalid draft，且不创建
+    数据库文件（公开约定 README.md:310-313）。
+
+  第 2 级 原稿查找（open_draft_for_update，
+    release_notes.py:372-394，调用点 release_notes.py:684）
+    → Version not found: <原版本名>
+    触发条件：输入有效，但数据库文件不存在；或文件存在但没有
+    drafts 表（完全空库或只有无关表）；或 drafts 表中查无原版本。
+    版本名按原文精确匹配、区分大小写：仅大小写不同的名称不匹配，
+    同样报 Version not found（公开约定 README.md:314-316）。
+    此级优先于名称冲突检查：原稿不存在且新名称已被占用时，仍
+    报告原稿不存在（源码推演：冲突检查 release_notes.py:704-708
+    位于原稿存在性确认之后，执行不到）。
+
+  第 3 级 名称冲突检查（release_notes.py:704-708）
+    → Version already exists: <新版本名>
+    触发条件：原稿存在，且新名称已被 drafts 表中任一草稿占用。
+    原名与新名完全相同（按原文逐字符比较，区分大小写）时查询
+    必然命中原稿自身，因此同名复制也按此失败，原稿保持不变
+    （公开约定 README.md:317-318）。
+
+  兜底（源码推演，非公开承诺的触发路径）：并发进程在第 2、3 级
+    检查之后抢先创建同名版本时，INSERT 触发 IntegrityError，
+    事务回滚并报 Version already exists: <新版本名>
+    （release_notes.py:727-729），不留部分副本。
+
+失败时的不变性依据（源码推演）：
+  - 第 1 级在校验失败时尚未连接数据库（校验位于
+    open_draft_for_update 之前），不会创建数据库文件。
+  - 第 2 级经 open_drafts_readonly 只读打开：文件不存在直接返回
+    None，不连接、不建库；文件存在但无 drafts 表时不执行任何建表
+    语句（release_notes.py:103-126）。
+  - 第 3 级与兜底发生在 with conn 事务内（release_notes.py:689），
+    冲突时未执行任何 INSERT；兜底时事务回滚，已插入的草稿行与
+    变更行一并撤销，不留部分副本。任何失败路径都不修改原稿与
+    其他版本的既有数据。
+
+
+--------------------------------------------------------------------------------
+六、约定性质与适用范围
+--------------------------------------------------------------------------------
+
+  - 公开约定（README.md 明文，可依赖）：命令形式与成功输出
+    （README.md:292-294、308-309）；复制以当前展示顺序为准、
+    position 从 0 连续编号、重复文本分别保留、多行仍是一条记录
+    （README.md:296-301）；原文保留不裁剪不转义、版本名区分大小写
+    （README.md:302-303）；两份草稿互不影响（README.md:304-307）；
+    三级失败的消息、退出码与“不建库、不补表、不留部分副本”的
+    不变性（README.md:310-320）。
+  - 源码推演（README 未逐字承诺，后续版本实现可变）：各检查在
+    源码中的具体先后与函数分工（第二节 (1)-(7)、第五节各级行号）；
+    --to 以 action="append" + nargs='?' + const="" 实现缺值落空
+    （release_notes.py:920-927）；读取与写入同事务、IntegrityError
+    兜底回滚（release_notes.py:689、727-729）；副本 position 由
+    enumerate 重新编号的具体写法（release_notes.py:719-726）。
+  - 第二、三节给出的全部标准输出、标准错误与退出码均为按当前
+    源码静态推演的预期结果，不是对 release_notes.py 的实际运行
+    观测；本说明撰写过程中未执行该程序、未创建 notes.sqlite。
+  - 适用范围：正常的本地 SQLite 草稿库（由本工具 create 建立、
+    结构符合 SCHEMA，release_notes.py:29-41）及上述已公开边界。
+    数据库文件损坏、被其他工具改写为不合 SCHEMA 的结构、文件系统
+    只读等异常环境不在本说明范围内。
+================================================================================
