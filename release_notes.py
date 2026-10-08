@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持十一个操作：
+支持十二个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
   list-drafts     列出全部已保存草稿的版本名与标题
@@ -11,6 +11,7 @@
   remove-change   按展示顺序删除已有草稿的一条变更
   move-change     按展示顺序移动已有草稿的一条变更
   rename-version  重命名已有草稿的版本名（标题与变更随版本名一起保留）
+  copy-version    复制已有草稿为一份新名称草稿（原版本保留，内容独立）
   export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
   export-changelog 按目录顺序把多份草稿汇总成一份 Markdown 导出到标准输出
 
@@ -660,6 +661,79 @@ def cmd_rename_version(args):
     return 0
 
 
+def cmd_copy_version(args):
+    # 仅允许一个 --to：未提供（None）、显式给出却缺值（nargs='?' 落空时
+    # 取空串常量）或重复提供（多于一个）都视为无效草稿。原版本名与新
+    # 版本名均非空白。校验全部发生在访问数据库之前，即使数据库文件或原
+    # 版本不存在也优先报 Invalid draft，失败时不会新建数据库文件。
+    to_names = args.to
+    if (
+        is_blank(args.version)
+        or to_names is None
+        or len(to_names) != 1
+        or is_blank(to_names[0])
+    ):
+        return fail("Invalid draft")
+    new_version = to_names[0]
+
+    # 文件存在性、drafts 表存在性与原版本存在性检查复用 set-title /
+    # add-change / set-change / remove-change / move-change / rename-version
+    # 共用的草稿访问流程：不创建数据库、不补建表、不改动原有表与数据，
+    # 失败信息已写入 stderr。原草稿在此确认，因此下面只需检查新名称是否
+    # 已被占用。
+    conn, error = open_draft_for_update(args.db, args.version)
+    if conn is None:
+        return error
+    try:
+        # 复制按原草稿当前内容进行：标题与变更都经由 show / export-markdown
+        # / export-changelog 共用的唯一读取实现取得，变更按展示顺序
+        # （position 升序），不去重、不裁剪、不转义，重复文本分别保留，
+        # 多行文本仍是一条记录；删除或移动过条目后以当前展示顺序为准。
+        draft = read_draft_on_conn(conn, args.version)
+        if draft is None:
+            # 极端兜底：open_draft_for_update 已确认存在，读取过程中被
+            # 其他事务删除。按原版本不存在处理，不补建任何内容。
+            return fail(f"Version not found: {args.version}")
+        title, changes = draft
+
+        try:
+            with conn:
+                # 先确认新名称未被占用，再写入新草稿：新名称按原文逐字符
+                # 比较，区分大小写；原名与新名相同也属于已占用，按失败处理。
+                conflict = conn.execute(
+                    "SELECT 1 FROM drafts WHERE version = ?", (new_version,)
+                ).fetchone()
+                if conflict is not None:
+                    return fail(f"Version already exists: {new_version}")
+
+                # 同一事务内插入草稿行与全部变更行：position 从 0 起按当前
+                # 展示顺序重新编号（与读取处的 ORDER BY position 完全一致），
+                # 标题、变更原文、条目数量与原草稿当前内容一致；重复文本的
+                # 各条仍是独立记录，多行文本仍是一条记录。原草稿的行与其
+                # 他版本均不改动，复制完成后两份草稿内容互相独立。
+                conn.execute(
+                    "INSERT INTO drafts(version, title) VALUES (?, ?)",
+                    (new_version, title),
+                )
+                conn.executemany(
+                    "INSERT INTO changes(version, position, content)"
+                    " VALUES (?, ?, ?)",
+                    [
+                        (new_version, position, content)
+                        for position, content in enumerate(changes)
+                    ],
+                )
+        except sqlite3.IntegrityError:
+            # 兜底：并发进程抢先创建同名版本时，事务回滚不留新草稿或部分
+            # 条目，原草稿与其他数据不变。
+            return fail(f"Version already exists: {new_version}")
+    finally:
+        conn.close()
+
+    print(f"Copied version: {args.version} -> {new_version}")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="版本发布说明管理台（本地 SQLite 草稿）"
@@ -830,6 +904,28 @@ def build_parser():
         help="新版本名（必填且仅允许一个），按原文原样保存，不裁剪空白",
     )
     parser_rename_version.set_defaults(func=cmd_rename_version)
+
+    parser_copy_version = subparsers.add_parser(
+        "copy-version",
+        help="复制已有草稿为一份新名称草稿，原版本保留，两份内容互相独立",
+    )
+    parser_copy_version.add_argument(
+        "version", help="原版本名，按原文精确匹配，区分大小写"
+    )
+    # 与 rename-version 的 --to 完全一致：action="append" 使重复提供可被
+    # 计数（多于一个即无效）；nargs='?' 配合 const="" 让显式给出却缺值的
+    # --to 以空串进入处理函数而非触发 argparse 自带报错，从而统一报
+    # Invalid draft（退出码 1）。值不设 default，省略时为 None，同样视为
+    # 无效。
+    parser_copy_version.add_argument(
+        "--to",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="新版本名（必填且仅允许一个），按原文原样保存，不裁剪空白",
+    )
+    parser_copy_version.set_defaults(func=cmd_copy_version)
 
     return parser
 
