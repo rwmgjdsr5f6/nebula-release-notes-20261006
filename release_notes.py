@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """版本发布说明管理台：基于本地 SQLite 的最小草稿功能。
 
-支持十个操作：
+支持十一个操作：
   create          创建版本草稿（标题 + 至少一条变更）
   show            按版本名精确查看草稿
   list-drafts     列出全部已保存草稿的版本名与标题
@@ -12,6 +12,7 @@
   move-change     按展示顺序移动已有草稿的一条变更
   rename-version  重命名已有草稿的版本名（标题与变更随版本名一起保留）
   export-markdown 按固定 Markdown 格式把单个草稿导出到标准输出
+  export-changelog 按 list-drafts 的筛选与顺序把多份草稿汇总导出到标准输出
 
 不提供发布或 Git 相关功能；Markdown 导出只写到标准输出，
 命令本身不接收输出路径，也不创建发布说明文件。
@@ -171,18 +172,44 @@ def cmd_show(args):
     return 0
 
 
+def validate_prefix_arg(prefixes):
+    """校验 list-drafts / export-changelog 共用的 --prefix 取值。
+
+    省略（None）时返回 (None, None)，表示不筛选；显式提供且恰有一个
+    非空白值时返回 (该原文, None)，值不裁剪；缺值（空串常量）、值为空
+    或仅含空白、重复提供时返回 (None, 1)，由调用方报 Invalid draft。
+    """
+    if prefixes is None:
+        return None, None
+    if len(prefixes) != 1 or is_blank(prefixes[0]):
+        return None, 1
+    return prefixes[0], None
+
+
+def select_draft_rows(conn, prefix):
+    """按 list-drafts 的同一规则筛选并排序草稿行。
+
+    入参为已确认 drafts 表存在的只读连接；返回 (版本名, 标题) 行列表。
+    前缀筛选在 Python 侧按版本名原文逐字符进行：区分大小写、不裁剪
+    空白、不解析语义版本，% 与 _ 是普通字符（不经 SQL LIKE 通配），
+    标题与变更内容不参与匹配；排序在 Python 侧按版本名原文的 Unicode
+    码点升序。省略前缀（None）时只排序不筛选。
+    """
+    rows = conn.execute("SELECT version, title FROM drafts").fetchall()
+    if prefix is not None:
+        rows = [row for row in rows if row[0].startswith(prefix)]
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
 def cmd_list_drafts(args):
     # --prefix 仅允许一次且值为非空白文本：省略（None）时保留全部目录
     # 行为；显式提供但缺值（nargs='?' 落空时取空串常量）、值为空或仅含
     # 空白、重复提供都视为无效草稿。校验先于任何数据库访问，即使数据库
     # 文件不存在也优先报 Invalid draft，且不创建数据库或补建表。
-    prefixes = args.prefix
-    if prefixes is not None:
-        if len(prefixes) != 1 or is_blank(prefixes[0]):
-            return fail("Invalid draft")
-        prefix = prefixes[0]
-    else:
-        prefix = None
+    prefix, error = validate_prefix_arg(args.prefix)
+    if error is not None:
+        return fail("Invalid draft")
 
     # 只读目录查询：复用 show / export-markdown 共用的只读打开流程，
     # 数据库文件不存在或没有 drafts 表时直接输出空数组，不连接、不建库、
@@ -191,21 +218,7 @@ def cmd_list_drafts(args):
     conn = open_drafts_readonly(args.db)
     if conn is not None:
         try:
-            rows = conn.execute(
-                "SELECT version, title FROM drafts"
-            ).fetchall()
-            if prefix is not None:
-                # 前缀筛选在 Python 侧按版本名原文逐字符进行：区分
-                # 大小写、不裁剪空白、不解析语义版本，中文与内部换行
-                # 按原文比较；% 与 _ 是普通字符（不经 SQL LIKE 通配），
-                # 标题与变更内容不参与匹配。
-                rows = [
-                    row for row in rows if row[0].startswith(prefix)
-                ]
-            # 排序在 Python 侧按版本名原文逐字符比较：即 Unicode
-            # 码点升序，前缀相同时较短名称在前，不做语义版本解析，
-            # 也不合并大小写不同的名称。
-            rows.sort(key=lambda row: row[0])
+            rows = select_draft_rows(conn, prefix)
             items = [
                 {"version": version, "title": title}
                 for version, title in rows
@@ -219,6 +232,19 @@ def cmd_list_drafts(args):
     return 0
 
 
+def render_markdown(version, title, changes):
+    """按固定 Markdown 格式渲染单个草稿片段，供 export-markdown 与
+    export-changelog 共用，保证汇总中的每份片段与单份导出逐字相同。
+
+    全程不转义、不整理空白："# " + 版本名原文 + 两个换行；标题原文 +
+    两个换行；每条变更按 show 的展示顺序加 "- " 前缀和一个换行，多行
+    条目只在首行前加前缀，内部换行与首尾空格原样保留。
+    """
+    parts = [f"# {version}\n\n", f"{title}\n\n"]
+    parts.extend(f"- {content}\n" for content in changes)
+    return "".join(parts)
+
+
 def cmd_export_markdown(args):
     # 版本名为空或仅由空白时优先报 Invalid draft，即使数据库文件不存在
     # 也是如此。校验发生在访问数据库之前，失败时不会新建数据库文件。
@@ -230,13 +256,52 @@ def cmd_export_markdown(args):
         return fail(f"Version not found: {args.version}")
     title, changes = draft
 
-    # 固定格式逐字拼接，全程不转义、不整理空白：
-    # "# " + 版本名原文 + 两个换行；标题原文 + 两个换行；
-    # 每条变更按 show 的展示顺序加 "- " 前缀和一个换行，多行条目只在
-    # 首行前加前缀，内部换行与首尾空格原样保留。
-    parts = [f"# {args.version}\n\n", f"{title}\n\n"]
-    parts.extend(f"- {content}\n" for content in changes)
-    sys.stdout.write("".join(parts))
+    sys.stdout.write(render_markdown(args.version, title, changes))
+    return 0
+
+
+def cmd_export_changelog(args):
+    # --prefix 规则与 list-drafts 完全一致：省略时汇总全部草稿；显式
+    # 提供却缺值、值为空或仅含空白、重复提供都报 Invalid draft。校验
+    # 先于任何数据库访问，即使数据库文件不存在也优先报此错误，且不创建
+    # 数据库或补建表。
+    prefix, error = validate_prefix_arg(args.prefix)
+    if error is not None:
+        return fail("Invalid draft")
+
+    # 只读汇总导出，复用只读打开流程：数据库文件不存在或没有 drafts 表
+    # 时不输出任何内容（退出码 0、两个输出流皆空），不建库、不补建表。
+    conn = open_drafts_readonly(args.db)
+    if conn is None:
+        return 0
+
+    try:
+        # 选中哪些草稿及排列顺序与同库同筛选条件的 list-drafts 完全一致：
+        # 只按版本名原文做前缀匹配，按版本名 Unicode 码点升序排列。
+        rows = select_draft_rows(conn, prefix)
+
+        # 每份片段逐字等同于对该版本执行 export-markdown 的成功输出；
+        # 全部草稿与变更在同一只读连接上按当前数据读取，保证一次汇总
+        # 内部各片段的选取与内容快照一致。没有匹配项时 fragments 为空，
+        # 不向标准输出写入任何字节。
+        fragments = []
+        for version, title in rows:
+            changes = [
+                content
+                for (content,) in conn.execute(
+                    "SELECT content FROM changes WHERE version = ?"
+                    " ORDER BY position",
+                    (version,),
+                )
+            ]
+            fragments.append(render_markdown(version, title, changes))
+    finally:
+        conn.close()
+
+    # 相邻片段之间额外插入一个换行；最后一份之后不追加其他内容，因此
+    # 单份命中时输出与 export-markdown 完全相同，无匹配时输出为空。
+    if fragments:
+        sys.stdout.write("\n".join(fragments))
     return 0
 
 
@@ -630,6 +695,26 @@ def build_parser():
         "version", help="要导出的版本名，按原文精确匹配，区分大小写"
     )
     parser_export_markdown.set_defaults(func=cmd_export_markdown)
+
+    parser_export_changelog = subparsers.add_parser(
+        "export-changelog",
+        help="按 list-drafts 的筛选与顺序把多份草稿汇总导出到标准输出",
+    )
+    # 参数定义与 list-drafts 的 --prefix 完全相同：action="append" 使重复
+    # 提供可被计数（多于一条即无效）；nargs='?' 配合 const="" 让显式给出
+    # 却缺值的 --prefix 以空串进入处理函数而非触发 argparse 自带报错，
+    # 从而统一报 Invalid draft（退出码 1）。值不设 default，省略时为
+    # None，表示不筛选、汇总全部草稿。
+    parser_export_changelog.add_argument(
+        "--prefix",
+        action="append",
+        nargs="?",
+        const="",
+        metavar="TEXT",
+        help="可选版本名前缀：仅汇总版本名原文以该文本开头的草稿，区分"
+        "大小写、不裁剪空白，%% 与 _ 为普通字符；省略则汇总全部草稿",
+    )
+    parser_export_changelog.set_defaults(func=cmd_export_changelog)
 
     parser_set_title = subparsers.add_parser(
         "set-title", help="只修订已有草稿的标题"
